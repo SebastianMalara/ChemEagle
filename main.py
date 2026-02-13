@@ -3,7 +3,7 @@ import torch
 import json
 from chemietoolkit import ChemIEToolkit,utils
 import cv2
-from openai import AzureOpenAI, OpenAI
+from openai import OpenAI
 import numpy as np
 from PIL import Image
 import json
@@ -19,6 +19,7 @@ from get_reaction_agent import get_reaction_withatoms_correctR
 from get_R_group_sub_agent import process_reaction_image_with_table_R_group, process_reaction_image_with_product_variant_R_group,get_full_reaction_template_OS,get_full_reaction_template, get_multi_molecular_full, process_reaction_image_with_table_R_group_OS,process_reaction_image_with_product_variant_R_group_OS,get_full_reaction_OS,get_reaction_OS
 from get_observer import action_observer_agent, plan_observer_agent,action_observer_agent_OS, plan_observer_agent_OS
 from get_text_agent import text_extraction_agent, text_extraction_agent_OS
+from llm_wrapper import LLMWrapper
 
 
 model = ChemIEToolkit(device=torch.device('cpu')) 
@@ -26,11 +27,6 @@ ckpt_path = "./rxn.ckpt"
 model1 = RxnIM(ckpt_path, device=torch.device('cpu'))
 device = torch.device('cpu')
 
-API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise ValueError("Please set API_KEY")
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
-API_VERSION = os.getenv("API_VERSION")
 
 def _normalize_tool_args(raw_args: Optional[dict], image_path: str) -> dict:
     if not isinstance(raw_args, dict):
@@ -50,12 +46,7 @@ def ChemEagle(
 ) -> dict:
     """
     """
-    # 初始化 Azure OpenAI 客户端
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    llm = LLMWrapper.from_env(default_model="gpt-5-mini")
 
     # 加载图像并编码为 Base64
     def encode_image(image_path: str):
@@ -166,8 +157,8 @@ def ChemEagle(
         planner_user_message = prompt_file.read()
 
     # Step 1: 调用 planner 获取 agent 列表
-    planner_response = client.chat.completions.create(
-        model='gpt-5-mini',
+    planner_output = llm.chat_completion_text(
+        model=os.getenv("LLM_MODEL", "gpt-5-mini"),
         messages=[
             {'role': 'system', 'content': "You are a chemical image understanding and extraction planning expert.After checking the image, your ONLY task is to SELECT and CALL the most appropriate agents from the list below to best fit the data extraction of the image."},
             {
@@ -179,9 +170,8 @@ def ChemEagle(
             }
         ]
     )
-    
+
     # 解析 planner 返回的 agent 列表
-    planner_output = planner_response.choices[0].message.content.strip()
     print(f"[D] Planner output: {planner_output}")
     
     # 提取 agent 名称（移除可能的括号、花括号等）
@@ -322,7 +312,7 @@ def ChemEagle(
     }
     
     completion_payload = {
-        'model': 'gpt-5-mini',
+        'model': os.getenv("LLM_MODEL", "gpt-5-mini"),
         'messages': [
             {'role': 'system', 'content': 'You are a helpful assistant.'},
             {
@@ -346,14 +336,14 @@ def ChemEagle(
     }
 
     # Generate new response
-    response = client.chat.completions.create(
+    response_text = llm.chat_completion_text(
         model=completion_payload["model"],
         messages=completion_payload["messages"],
         response_format={ 'type': 'json_object' },
     )
 
     # 获取 GPT 生成的结果
-    gpt_output = json.loads(response.choices[0].message.content)
+    gpt_output = json.loads(response_text)
     print(gpt_output)
     return gpt_output
 
