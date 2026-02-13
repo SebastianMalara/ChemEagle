@@ -48,6 +48,33 @@ In this work, we present ChemEAGLE, a multimodal large language model (MLLM)-bas
 
 
 ## :rocket: Using the code for ChemEAGLE
+### Quick installer (models + API configuration)
+
+You can run the interactive installer to download required model files, optionally clone helper repos, and generate an LLM environment file:
+
+```bash
+python installer.py
+```
+
+What it does:
+- Downloads required model weights from `CYF200127/ChemEAGLEModel` into `./models` (and mirrors key files in project root for default paths).
+- Optionally clones helper repositories (for example, ChemRxnExtractor) into `./external`.
+- Guides you through selecting an LLM provider and writes `.env.chemeagle` plus `load_chemeagle_env.sh`.
+
+Then load your LLM settings:
+
+```bash
+source ./load_chemeagle_env.sh
+```
+
+Useful options:
+
+```bash
+python installer.py --provider openai
+python installer.py --model-dir ./models --repos-dir ./external
+python installer.py --dry-run
+```
+
 ### Using the code
 Clone the following repositories:
 ```
@@ -267,5 +294,4 @@ The input can be any chemical graphics; feel free to try more examples!
 ## :warning: Acknowledgement
 1. We use api_version="2024-10-21" with the HKUST Azure OpenAI endpoint as our official version.
 2. Our code is based on [MolNexTR](https://github.com/CYF2000127/MolNexTR), [MolScribe](https://github.com/thomas0809/MolScribe), [RxnIM](https://github.com/CYF2000127/RxnIM), [RxnScribe](https://github.com/thomas0809/RxNScribe), [ChemNER](https://github.com/Ozymandias314/ChemIENER), [ChemRxnExtractor](https://github.com/jiangfeng1124/ChemRxnExtractor), [AutoAgents](https://github.com/Link-AGI/AutoAgents), and [Azure OpenAI](https://azure.microsoft.com/).
-
 
