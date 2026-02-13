@@ -4,31 +4,20 @@ import os
 import time
 from typing import Any, List, Optional
 
-from openai import AzureOpenAI, OpenAI
+from openai import OpenAI
 from openai import InternalServerError, RateLimitError, APIError
+from llm_wrapper import LLMWrapper
 
-
-API_KEY = os.getenv("API_KEY")
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
-API_VERSION = os.getenv("API_VERSION")
 
 _client = None
 
 def _get_client():
     global _client
     if _client is None:
-        api_key = API_KEY or os.getenv("AZURE_OPENAI_API_KEY")
-        azure_endpoint = AZURE_ENDPOINT or os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_version = API_VERSION or "2024-06-01"
-        
-        if not api_key or not azure_endpoint:
+        try:
+            _client = LLMWrapper.from_env(default_model="gpt-5-mini")
+        except Exception:
             return None
-        
-        _client = AzureOpenAI(
-            api_key=api_key,
-            api_version=api_version,
-            azure_endpoint=azure_endpoint,
-        )
     return _client
 
 PLAN_PROMPT_TEMPLATE = """System Message: 
@@ -116,15 +105,14 @@ def plan_observer_agent(image_path: str, tool_calls: List[Any]) -> List[Any]:
             # 没有 API 配置，返回原始计划
             return tool_calls
         
-        response = client.chat.completions.create(
-            model="gpt-5-mini",
+        content = client.chat_completion_text(
+            model=os.getenv("LLM_MODEL", "gpt-5-mini"),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": user_content},
             ],
         )
-        content = response.choices[0].message.content
         parsed = json.loads(content)
         # Support both "plan" and "list_of_agents" keys for compatibility
         return parsed.get("list_of_agents", parsed.get("plan", tool_calls))
@@ -152,15 +140,14 @@ def action_observer_agent(image_path: str, tool_result: Any) -> bool:
             # 没有 API 配置，返回 False（不重做）
             return False
         
-        response = client.chat.completions.create(
-            model="gpt-5-mini",
+        content = client.chat_completion_text(
+            model=os.getenv("LLM_MODEL", "gpt-5-mini"),
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user", "content": user_content},
             ],
         )
-        content = response.choices[0].message.content
         parsed = json.loads(content)
         return bool(parsed.get("redo", False))
     except Exception:

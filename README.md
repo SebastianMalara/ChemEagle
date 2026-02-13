@@ -68,11 +68,40 @@ pip install -r requirements.txt
 
 3. Download the necessary [models](https://huggingface.co/CYF200127/ChemEAGLEModel/tree/main) and put in the main path.
 
-4. Set up your Azure OpenAI API key in your environment. Here are two detailed tutorials ([Chinese Version](https://zhuanlan.zhihu.com/p/678367436), [English Version](https://www.datacamp.com/tutorial/azure-openai)) on how to obtain the Azure OpenAI API key and endpoint (Remember to use the API key and the endpoint in the Azure AI Studio).
+4. Configure the LLM provider via environment variables.
+
+- **Azure OpenAI** (default):
 ```bash
+export LLM_PROVIDER=azure
 export API_KEY=your-azure-openai-api-key
 export AZURE_ENDPOINT=your-azure-endpoint
 export API_VERSION=your-api-version
+export LLM_MODEL=gpt-5-mini
+```
+
+- **OpenAI**:
+```bash
+export LLM_PROVIDER=openai
+export OPENAI_API_KEY=your-openai-api-key
+export LLM_MODEL=gpt-5-mini
+# optional
+# export OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+- **Anthropic**:
+```bash
+export LLM_PROVIDER=anthropic
+export ANTHROPIC_API_KEY=your-anthropic-api-key
+export LLM_MODEL=claude-3-5-sonnet-latest
+```
+
+
+- **LM Studio / OpenAI-compatible local server**:
+```bash
+export LLM_PROVIDER=lmstudio
+export LLM_BASE_URL=http://127.0.0.1:1234/v1
+export LLM_API_KEY=lm-studio  # LM Studio typically accepts any non-empty key
+export LLM_MODEL=your-local-model-name
 ```
 
 5. Run the following code to extract machine-readable chemical data from chemical graphics:
