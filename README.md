@@ -295,3 +295,167 @@ The input can be any chemical graphics; feel free to try more examples!
 1. We use api_version="2024-10-21" with the HKUST Azure OpenAI endpoint as our official version.
 2. Our code is based on [MolNexTR](https://github.com/CYF2000127/MolNexTR), [MolScribe](https://github.com/thomas0809/MolScribe), [RxnIM](https://github.com/CYF2000127/RxnIM), [RxnScribe](https://github.com/thomas0809/RxNScribe), [ChemNER](https://github.com/Ozymandias314/ChemIENER), [ChemRxnExtractor](https://github.com/jiangfeng1124/ChemRxnExtractor), [AutoAgents](https://github.com/Link-AGI/AutoAgents), and [Azure OpenAI](https://azure.microsoft.com/).
 
+
+## 🖥️ Dell XPS (Ubuntu + NVIDIA dGPU) deployment guide
+
+### Readiness verdict
+ChemEAGLE is **ready to run on a Dell XPS with Ubuntu and NVIDIA discrete graphics**, with two practical notes:
+
+1. The repository defaults core inference objects to CPU for stability, so GPU acceleration is optional and primarily relevant when running the local `ChemEagle_OS` path with a local vLLM model server.
+2. A planner prompt path mismatch has been corrected in `main.py` (`prompt_plan.txt` is now used), so the default planner step no longer points to a missing file.
+
+### Recommended target environment
+- Ubuntu 22.04/24.04 LTS
+- NVIDIA proprietary driver + working `nvidia-smi`
+- Python 3.10 (Conda env recommended)
+- Optional for local high-throughput inference: CUDA-compatible stack + vLLM
+
+### 0) Fast preflight (recommended before go-live)
+
+Run the built-in preflight checker:
+
+```bash
+python scripts/preflight_check.py
+```
+
+This verifies platform basics, GPU visibility (`nvidia-smi`), and required local model/prompt files.
+
+### 1) System preparation on Ubuntu
+
+```bash
+sudo apt update
+sudo apt install -y git build-essential python3-dev poppler-utils tesseract-ocr libgl1 libglib2.0-0
+```
+
+Why these packages:
+- `poppler-utils` is required by PDF image extraction flows (`pdf2image`).
+- `tesseract-ocr` is used by OCR pipelines.
+- `libgl1`/`libglib2.0-0` are commonly needed by OpenCV on headless Ubuntu systems.
+
+### 2) Verify NVIDIA GPU availability
+
+```bash
+nvidia-smi
+```
+
+If this command fails, install/repair NVIDIA drivers before continuing.
+
+### 3) Clone and create environment
+
+```bash
+git clone https://github.com/CYF2000127/ChemEagle
+cd ChemEagle
+conda create -n chemeagle python=3.10 -y
+conda activate chemeagle
+```
+
+### 4) Install Python dependencies
+
+Install base dependencies first:
+
+```bash
+pip install -r requirements.txt
+```
+
+If you want GPU-enabled PyTorch for local workloads, reinstall torch from the official CUDA index that matches your driver/CUDA runtime (example for CUDA 12.1):
+
+```bash
+pip install --upgrade --force-reinstall torch==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+```
+
+Verify torch sees CUDA:
+
+```bash
+python -c "import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available())"
+```
+
+### 5) Download models and configure provider
+
+Use the built-in installer:
+
+```bash
+python installer.py
+```
+
+This downloads required checkpoints and creates `.env.chemeagle` + `load_chemeagle_env.sh`.
+
+Load env vars:
+
+```bash
+source ./load_chemeagle_env.sh
+```
+
+### 6) Choose runtime mode
+
+#### Mode A: Cloud LLM mode (`ChemEagle`)
+
+Set one provider:
+
+- Azure OpenAI: `LLM_PROVIDER=azure` (+ endpoint/key/version/model)
+- OpenAI: `LLM_PROVIDER=openai` (+ `OPENAI_API_KEY`)
+- Anthropic: `LLM_PROVIDER=anthropic` (+ `ANTHROPIC_API_KEY`)
+
+Run:
+
+```bash
+python - <<'PY'
+from main import ChemEagle
+print(ChemEagle('./examples/1.png'))
+PY
+```
+
+#### Mode B: Local open-source mode (`ChemEagle_OS` + vLLM)
+
+Install and start vLLM (Linux):
+
+```bash
+pip install vllm
+vllm serve /path/to/Qwen3-VL-32B-Instruct-AWQ \
+  --port 8000 \
+  --trust-remote-code \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes \
+  --max-model-len 27200 \
+  --limit-mm-per-prompt video=0
+```
+
+Then run:
+
+```bash
+python - <<'PY'
+from main import ChemEagle_OS
+print(ChemEagle_OS('./examples/1.png'))
+PY
+```
+
+### 7) Run on PDF input
+
+```bash
+python - <<'PY'
+import os
+from main import ChemEagle
+from pdf_extraction import run_pdf
+
+pdf_path='your/pdf/path'
+output_dir='your/output/dir'
+run_pdf(pdf_dir=pdf_path, image_dir=output_dir)
+
+results=[]
+for fname in sorted(os.listdir(output_dir)):
+    if fname.lower().endswith('.png'):
+        path=os.path.join(output_dir, fname)
+        out=ChemEagle(path)
+        out['image_name']=fname
+        results.append(out)
+print(results)
+PY
+```
+
+### 8) Dell XPS troubleshooting checklist
+
+- If OpenCV import fails: ensure `libgl1` and `libglib2.0-0` are installed.
+- If PDF conversion fails: ensure `poppler-utils` is installed and in `PATH`.
+- If OCR quality is poor: verify `tesseract-ocr` installation and language packs.
+- If GPU is not used: verify `torch.cuda.is_available()` and that vLLM is running with NVIDIA runtime.
+- If local model startup OOMs: use a smaller quantized model, reduce max context, or run cloud mode.
+
