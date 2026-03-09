@@ -189,6 +189,72 @@ def _assistant_message_to_dict(message) -> dict:
     return payload
 
 
+def _extract_json_from_text(raw_content: Optional[str]):
+    if not raw_content:
+        return None
+
+    try:
+        return json.loads(raw_content)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        from get_R_group_sub_agent import extract_json_from_text_with_reasoning
+        return extract_json_from_text_with_reasoning(raw_content)
+    except Exception:
+        return None
+
+
+def _repair_json_via_model(client, model_name: str, raw_content: str, max_attempts: int = 2):
+    """Ask the model to convert malformed output to strict JSON only."""
+    candidate = raw_content
+    for attempt in range(max_attempts):
+        repair_messages = [
+            {
+                "role": "system",
+                "content": "You repair malformed assistant output. Return valid JSON only, no markdown, no explanation.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Convert the following content to valid JSON. Preserve all information. "
+                    "If information is missing, wrap the original text as {\"content\": <text>}.\n\n"
+                    f"{candidate}"
+                ),
+            },
+        ]
+        response = _chat_completion_with_json_fallback(
+            client,
+            model=model_name,
+            messages=repair_messages,
+            response_format={"type": "json_object"},
+        )
+        candidate = response.choices[0].message.content or ""
+        parsed = _extract_json_from_text(candidate)
+        if parsed is not None:
+            if attempt > 0:
+                print(f"✓ JSON 修复成功（第 {attempt + 1} 次尝试）")
+            return parsed
+    return None
+
+
+def _safe_parse_agent_json(client, model_name: str, raw_content: Optional[str]) -> dict:
+    if not raw_content:
+        return {}
+
+    parsed = _extract_json_from_text(raw_content)
+    if parsed is not None:
+        return parsed
+
+    print("⚠️ 检测到非 JSON 输出，正在自动修复...")
+    repaired = _repair_json_via_model(client, model_name, raw_content)
+    if repaired is not None:
+        return repaired
+
+    print("⚠️ JSON 自动修复失败，返回原始文本")
+    return {"content": raw_content}
+
+
 def merge_sentences(sentences):
     """
     合并一个句子片段列表为一个连贯的段落字符串。
@@ -455,7 +521,7 @@ Here is my step-by-step analysis:
     tool_calls = assistant_message.tool_calls
     if not tool_calls:
         # If no tool calls, return the response directly
-        return json.loads(response1.choices[0].message.content) if response1.choices[0].message.content else {}
+        return _safe_parse_agent_json(client, model_name, response1.choices[0].message.content)
     
     tool_results_msgs = []
     for call in tool_calls:
@@ -488,7 +554,7 @@ Here is my step-by-step analysis:
         #           response_format={"type": "json_object"}
     )
 
-    return json.loads(response2.choices[0].message.content)
+    return _safe_parse_agent_json(client, model_name, response2.choices[0].message.content)
 
 
 def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
