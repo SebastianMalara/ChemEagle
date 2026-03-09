@@ -24,6 +24,7 @@ import os
 import copy
 from typing import Optional
 import time
+from runtime_device import resolve_torch_device
 
 
 def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
@@ -60,31 +61,19 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
     raise RuntimeError("API 调用失败，未知错误")
 
 
-def _resolve_device() -> torch.device:
-    pref = os.getenv("CHEMEAGLE_DEVICE", "auto").strip().lower()
-    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-    if pref == "cuda":
-        if torch.cuda.is_available():
-            return torch.device('cuda')
-        print("CHEMEAGLE_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
-        return torch.device('cpu')
-    if pref in {"metal", "mps"}:
-        if mps_available:
-            return torch.device('mps')
-        print("CHEMEAGLE_DEVICE=metal requested but MPS is unavailable. Falling back to CPU.")
-        return torch.device('cpu')
-    if pref == "auto":
-        if torch.cuda.is_available():
-            return torch.device('cuda')
-        if mps_available:
-            return torch.device('mps')
-    return torch.device('cpu')
+_RUNTIME_DEVICE_TYPE: Optional[str] = None
+_RUNTIME_TOOLKIT: Optional[ChemIEToolkit] = None
 
 
-device = _resolve_device()
-ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device=device)
-model = ChemIEToolkit(device=device)
+def _get_toolkit() -> ChemIEToolkit:
+    global _RUNTIME_DEVICE_TYPE, _RUNTIME_TOOLKIT
+
+    device = resolve_torch_device()
+    if _RUNTIME_TOOLKIT is None or _RUNTIME_DEVICE_TYPE != device.type:
+        _RUNTIME_TOOLKIT = ChemIEToolkit(device=device)
+        _RUNTIME_DEVICE_TYPE = device.type
+        print(f"[ChemEagle] Molecular agent runtime using {device.type.upper()}.")
+    return _RUNTIME_TOOLKIT
 
 def _get_azure_client() -> AzureOpenAI | OpenAI:
     provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
@@ -159,7 +148,7 @@ def get_multi_molecular(image_path: str) -> list:
     image = Image.open(image_path).convert('RGB')
     
     # 将图像作为输入传递给模型
-    coref_results = model.extract_molecule_corefs_from_figures([image])
+    coref_results = _get_toolkit().extract_molecule_corefs_from_figures([image])
     #print(f"coref_results:{coref_results}")
     for item in coref_results:
         for bbox in item.get("bboxes", []):
@@ -176,7 +165,7 @@ def get_multi_molecular_text_to_correct(image_path: str) -> list:
     image = Image.open(image_path).convert('RGB')
     
     # 将图像作为输入传递给模型
-    coref_results = model.extract_molecule_corefs_from_figures([image])
+    coref_results = _get_toolkit().extract_molecule_corefs_from_figures([image])
     for item in coref_results:
         for bbox in item.get("bboxes", []):
             for key in ["category", "bbox", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs']: #'atoms'
@@ -192,7 +181,7 @@ def get_multi_molecular_text_to_correct_withatoms(image_path: str) -> list:
     image = Image.open(image_path).convert('RGB')
     
     # 将图像作为输入传递给模型
-    coref_results = model.extract_molecule_corefs_from_figures([image])
+    coref_results = _get_toolkit().extract_molecule_corefs_from_figures([image])
     for item in coref_results:
         for bbox in item.get("bboxes", []):
             for key in ["coords","edges","molfile", 'atoms', "bonds", 'category_id', 'score', 'corefs']: #'atoms'
@@ -365,7 +354,7 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
         image = Image.open(image_path).convert('RGB')
         
         # 将图像作为输入传递给模型
-        coref_results = model.extract_molecule_corefs_from_figures([image])
+        coref_results = _get_toolkit().extract_molecule_corefs_from_figures([image])
         return coref_results
 
     
@@ -613,7 +602,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
         image = Image.open(image_path).convert('RGB')
         
         # 将图像作为输入传递给模型
-        coref_results = model.extract_molecule_corefs_from_figures([image])
+        coref_results = _get_toolkit().extract_molecule_corefs_from_figures([image])
         return coref_results
 
     
@@ -856,7 +845,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
         image = Image.open(image_path).convert('RGB')
         
         # 将图像作为输入传递给模型
-        coref_results = model.extract_molecule_corefs_from_figures([image])
+        coref_results = _get_toolkit().extract_molecule_corefs_from_figures([image])
         return coref_results
 
     
@@ -1142,7 +1131,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
         image = Image.open(image_path).convert('RGB')
         
         # 将图像作为输入传递给模型
-        coref_results = model.extract_molecule_corefs_from_figures([image])
+        coref_results = _get_toolkit().extract_molecule_corefs_from_figures([image])
         return coref_results
 
     coref_results = get_multi_molecular(image_path)

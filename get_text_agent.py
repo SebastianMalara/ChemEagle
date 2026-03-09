@@ -15,9 +15,10 @@ import shutil
 import re
 import time
 from openai import InternalServerError, RateLimitError, APIError
+from runtime_device import resolve_torch_device, warn_once
 
-
-_CHEMNER_MODEL = None
+_CHEMNER_MODELS: dict[str, ChemNER] = {}
+_RXN_EXTRACTORS: dict[str, RxnExtractor] = {}
 
 def _get_azure_client() -> AzureOpenAI | OpenAI:
     provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
@@ -91,20 +92,27 @@ def _get_text_agent_client() -> OpenAI:
 
 
 def _get_rxn_extractor() -> RxnExtractor:
-    return RxnExtractor(model_dir, use_cuda=False)
+    device = resolve_torch_device()
+    cache_key = "cuda" if device.type == "cuda" else "cpu"
+    if cache_key not in _RXN_EXTRACTORS:
+        if device.type == "mps":
+            warn_once("Text reaction extractor does not support MPS directly. Using CPU for RxnExtractor.")
+        _RXN_EXTRACTORS[cache_key] = RxnExtractor(model_dir, use_cuda=(device.type == "cuda"))
+    return _RXN_EXTRACTORS[cache_key]
 
 
 def _get_chemner_model() -> ChemNER:
-    global _CHEMNER_MODEL
-    if _CHEMNER_MODEL is not None:
-        return _CHEMNER_MODEL
+    device = resolve_torch_device()
+    cache_key = device.type
+    if cache_key in _CHEMNER_MODELS:
+        return _CHEMNER_MODELS[cache_key]
 
     local_ckpt_path = ckpt_path
     if not os.path.exists(local_ckpt_path):
         local_ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "ner.ckpt")
 
-    _CHEMNER_MODEL = ChemNER(local_ckpt_path, device=torch.device('cpu'))
-    return _CHEMNER_MODEL
+    _CHEMNER_MODELS[cache_key] = ChemNER(local_ckpt_path, device=device)
+    return _CHEMNER_MODELS[cache_key]
 
 
 def configure_tesseract() -> bool:

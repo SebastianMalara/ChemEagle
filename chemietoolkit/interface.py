@@ -11,11 +11,12 @@ from chemiener import ChemNER
 from .chemrxnextractor import ChemRxnExtractor
 from .tableextractor import TableExtractor
 from .utils import *
+from runtime_device import resolve_torch_device, warn_once
 
 class ChemIEToolkit:
     def __init__(self, device=None):
         if device is None:
-            self.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+            self.device = resolve_torch_device()
         else:
             self.device = torch.device(device)
 
@@ -131,6 +132,8 @@ class ChemIEToolkit:
         """
         if ckpt_path is None:
             ckpt_path = snapshot_download(repo_id="amberwang/chemrxnextractor-training-modules")
+        if self.device.type == "mps":
+            warn_once("ChemRxnExtractor does not support MPS directly. Using CPU for text reaction extraction.")
         self._chemrxnextractor = ChemRxnExtractor("", None, ckpt_path, self.device.type)
 
 

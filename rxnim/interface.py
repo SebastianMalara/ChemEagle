@@ -81,7 +81,7 @@ class RxnIM:
         return molnextr
 
     def get_ocr_model(self):
-        reader = easyocr.Reader(['en'], gpu=(self.device.type == 'cuda'))
+        reader = easyocr.Reader(['en'], gpu=(self.device.type in {'cuda', 'mps'}))
         return reader
 
     def predict_images(self, input_images: List, batch_size=16, molnextr=False, ocr=False):
@@ -227,7 +227,7 @@ class MolDetect:
         return molnextr
 
     def get_ocr_model(self):
-        reader = easyocr.Reader(['en'], gpu = (self.device.type == 'cuda'))
+        reader = easyocr.Reader(['en'], gpu = (self.device.type in {'cuda', 'mps'}))
         return reader
     
     def predict_images(self, input_images: List, batch_size = 16, molnextr = False, coref = False, ocr = False):
@@ -285,5 +285,4 @@ class MolDetect:
         plt.close(fig)
         return results
             
-
 

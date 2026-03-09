@@ -13,31 +13,6 @@ from rxnim import RxnIM
 import json
 import base64
 import os
-def _resolve_device() -> torch.device:
-    pref = os.getenv("CHEMEAGLE_DEVICE", "auto").strip().lower()
-    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-    if pref == "cuda":
-        if torch.cuda.is_available():
-            return torch.device('cuda')
-        print("CHEMEAGLE_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
-        return torch.device('cpu')
-    if pref in {"metal", "mps"}:
-        if mps_available:
-            return torch.device('mps')
-        print("CHEMEAGLE_DEVICE=metal requested but MPS is unavailable. Falling back to CPU.")
-        return torch.device('cpu')
-    if pref == "auto":
-        if torch.cuda.is_available():
-            return torch.device('cuda')
-        if mps_available:
-            return torch.device('mps')
-    return torch.device('cpu')
-
-
-device = _resolve_device()
-model = ChemIEToolkit(device=device)
-ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device=device)
 import base64
 import torch
 import json
@@ -52,6 +27,27 @@ import io
 import re
 import time
 from openai import InternalServerError, RateLimitError, APIError
+from runtime_device import resolve_torch_device
+
+_RUNTIME_DEVICE_TYPE: Optional[str] = None
+_RUNTIME_TOOLKIT: Optional[ChemIEToolkit] = None
+_RUNTIME_RXNIM: Optional[RxnIM] = None
+
+
+def _get_runtime_models() -> tuple[ChemIEToolkit, RxnIM]:
+    global _RUNTIME_DEVICE_TYPE, _RUNTIME_TOOLKIT, _RUNTIME_RXNIM
+
+    device = resolve_torch_device()
+    if (
+        _RUNTIME_TOOLKIT is None
+        or _RUNTIME_RXNIM is None
+        or _RUNTIME_DEVICE_TYPE != device.type
+    ):
+        _RUNTIME_TOOLKIT = ChemIEToolkit(device=device)
+        _RUNTIME_RXNIM = RxnIM("./rxn.ckpt", device=device)
+        _RUNTIME_DEVICE_TYPE = device.type
+        print(f"[ChemEagle] R-group agent runtime using {device.type.upper()}.")
+    return _RUNTIME_TOOLKIT, _RUNTIME_RXNIM
 
 
 
@@ -630,7 +626,8 @@ def get_multi_molecular_full(image_path: str) -> list:
     
     # 将图像作为输入传递给模型
     #coref_results = process_reaction_image_with_multiple_products_and_text_correctmultiR(image_path)
-    coref_results = model.extract_molecule_corefs_from_figures([image])
+    toolkit, _ = _get_runtime_models()
+    coref_results = toolkit.extract_molecule_corefs_from_figures([image])
     for item in coref_results:
         for bbox in item.get("bboxes", []):
             for key in ["category", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs',"coords","edges"]: #'atoms'
@@ -730,7 +727,8 @@ def get_reaction_full(image_path: str) -> dict:
     including only reactants, conditions, and products with their smiles, bbox, or text.
     '''
     image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+    _, rxnim_model = _get_runtime_models()
+    raw_prediction = rxnim_model.predict_image_file(image_file, molnextr=True, ocr=True)
     #raw_prediction = get_reaction_withatoms_correctR(image_path)
     return raw_prediction
 
@@ -838,7 +836,8 @@ def get_full_reaction_template(image_path: str) -> dict:
     '''
     image = Image.open(image_path).convert('RGB')
     image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+    _, rxnim_model = _get_runtime_models()
+    raw_prediction = rxnim_model.predict_image_file(image_file, molnextr=True, ocr=True)
     ####################raw_prediction = get_reaction_withatoms_correctR(image_path)###############################################################################################
     for reaction in raw_prediction:
         for section in ("reactants", "products", "conditions"):
@@ -880,7 +879,8 @@ def get_full_reaction_template_OS(image_path: str) -> dict:
     '''
     image = Image.open(image_path).convert('RGB')
     image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+    _, rxnim_model = _get_runtime_models()
+    raw_prediction = rxnim_model.predict_image_file(image_file, molnextr=True, ocr=True)
     ####################raw_prediction = get_reaction_withatoms_correctR(image_path)###############################################################################################
     for reaction in raw_prediction:
         for section in ("reactants", "products", "conditions"):
@@ -1171,7 +1171,8 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
     #p#print.p#print(smiles_details)
 
         # 整理反应数据
-    backed_out = utils.backout_without_coref(reaction_results, coref_results, gpt_output, smiles_details, model.molnextr)
+    toolkit, _ = _get_runtime_models()
+    backed_out = utils.backout_without_coref(reaction_results, coref_results, gpt_output, smiles_details, toolkit.molnextr)
     backed_out.sort(key=lambda x: x[2])
     extracted_rxns = {}
     for reactants, products_, label in backed_out:
@@ -1459,7 +1460,8 @@ def process_reaction_image_with_product_variant_R_group_OS(
         products.append(product['smiles'])
 
     # 整理反应数据
-    backed_out = utils.backout_without_coref(reaction_results, coref_results, gpt_output, smiles_details, model.molnextr)
+    toolkit, _ = _get_runtime_models()
+    backed_out = utils.backout_without_coref(reaction_results, coref_results, gpt_output, smiles_details, toolkit.molnextr)
     backed_out.sort(key=lambda x: x[2])
     extracted_rxns = {}
     for reactants, products_, label in backed_out:

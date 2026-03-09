@@ -22,33 +22,6 @@ from get_text_agent import text_extraction_agent, text_extraction_agent_OS
 from llm_wrapper import LLMWrapper
 
 
-def _resolve_device() -> torch.device:
-    pref = os.getenv("CHEMEAGLE_DEVICE", "auto").strip().lower()
-    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-    if pref == "cuda":
-        if torch.cuda.is_available():
-            return torch.device('cuda')
-        print("CHEMEAGLE_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
-        return torch.device('cpu')
-    if pref in {"metal", "mps"}:
-        if mps_available:
-            return torch.device('mps')
-        print("CHEMEAGLE_DEVICE=metal requested but MPS is unavailable. Falling back to CPU.")
-        return torch.device('cpu')
-    if pref == "auto":
-        if torch.cuda.is_available():
-            return torch.device('cuda')
-        if mps_available:
-            return torch.device('mps')
-    return torch.device('cpu')
-
-
-device = _resolve_device()
-model = ChemIEToolkit(device=device)
-ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device=device)
-
-
 def _normalize_tool_args(raw_args: Optional[dict], image_path: str) -> dict:
     if not isinstance(raw_args, dict):
         return {"image_path": image_path}

@@ -120,6 +120,8 @@ def _release_gpu_memory() -> None:
             torch.cuda.empty_cache()
             if hasattr(torch.cuda, 'ipc_collect'):
                 torch.cuda.ipc_collect()
+        if hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
+            torch.mps.empty_cache()
     except Exception:
         pass
     gc.collect()
@@ -207,8 +209,13 @@ def run_pipeline(
         else:
             return '\n'.join(status_bits + [f'Unsupported file type: {suffix}']), '{}'
     except Exception as e:
-        if chemeagle_device in {'auto', 'cuda'} and any(msg in str(e).lower() for msg in ['cuda out of memory', 'out of memory']) and suffix != '.pdf':
-            status_bits.append('CUDA OOM detected; retrying once on CPU.')
+        error_text = str(e).lower()
+        is_device_oom = any(
+            msg in error_text
+            for msg in ['cuda out of memory', 'mps out of memory', 'out of memory']
+        )
+        if chemeagle_device in {'auto', 'cuda', 'metal', 'mps'} and is_device_oom and suffix != '.pdf':
+            status_bits.append('Device OOM detected; retrying once on CPU.')
             try:
                 _release_gpu_memory()
                 result = _run_on_image_cpu_subprocess(file_path, mode)

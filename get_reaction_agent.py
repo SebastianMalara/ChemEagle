@@ -19,6 +19,7 @@ from PIL import Image
 import os
 from typing import Optional
 import time
+from runtime_device import resolve_torch_device
 
 def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
     last_exception = None
@@ -53,31 +54,19 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
         raise last_exception
     raise RuntimeError("API 调用失败，未知错误")
 
-def _resolve_device() -> torch.device:
-    pref = os.getenv("CHEMEAGLE_DEVICE", "auto").strip().lower()
-    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-    if pref == "cuda":
-        if torch.cuda.is_available():
-            return torch.device('cuda')
-        print("CHEMEAGLE_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
-        return torch.device('cpu')
-    if pref in {"metal", "mps"}:
-        if mps_available:
-            return torch.device('mps')
-        print("CHEMEAGLE_DEVICE=metal requested but MPS is unavailable. Falling back to CPU.")
-        return torch.device('cpu')
-    if pref == "auto":
-        if torch.cuda.is_available():
-            return torch.device('cuda')
-        if mps_available:
-            return torch.device('mps')
-    return torch.device('cpu')
+_RUNTIME_DEVICE_TYPE: Optional[str] = None
+_RUNTIME_RXNIM: Optional[RxnIM] = None
 
 
-device = _resolve_device()
-ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device=device)
-model = ChemIEToolkit(device=device)
+def _get_rxnim() -> RxnIM:
+    global _RUNTIME_DEVICE_TYPE, _RUNTIME_RXNIM
+
+    device = resolve_torch_device()
+    if _RUNTIME_RXNIM is None or _RUNTIME_DEVICE_TYPE != device.type:
+        _RUNTIME_RXNIM = RxnIM("./rxn.ckpt", device=device)
+        _RUNTIME_DEVICE_TYPE = device.type
+        print(f"[ChemEagle] Reaction agent runtime using {device.type.upper()}.")
+    return _RUNTIME_RXNIM
 
 def _get_azure_client() -> AzureOpenAI | OpenAI:
     provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
@@ -155,7 +144,7 @@ def get_reaction(image_path: str) -> dict:
     image = Image.open(image_file)
 
     image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+    raw_prediction = _get_rxnim().predict_image_file(image_file, molnextr=True, ocr=True)
     #print(f'raw_prediction:{raw_prediction}')
 
     # Ensure raw_prediction is treated as a list directly
@@ -192,7 +181,7 @@ def get_full_reaction(image_path: str) -> dict:
     including reactants, conditions, and products, with their smiles, text, and bbox.
     '''
     image_file = image_path
-    raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+    raw_prediction = _get_rxnim().predict_image_file(image_file, molnextr=True, ocr=True)
     for reaction in raw_prediction:
         for section in ("reactants", "products", "conditions"):
             for entry in reaction.get(section, []):
@@ -371,7 +360,7 @@ def get_reaction_withatoms(image_path: str) -> dict:
         including reactants, conditions, and products, with their smiles, text, and bbox.
         '''
         image_file = image_path
-        raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+        raw_prediction = _get_rxnim().predict_image_file(image_file, molnextr=True, ocr=True)
         return raw_prediction
     
     input2 = get_reaction_full(image_path)
@@ -584,7 +573,7 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
         '''
 
         image_file = image_path
-        raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+        raw_prediction = _get_rxnim().predict_image_file(image_file, molnextr=True, ocr=True)
         return raw_prediction
     
     input2 = get_reaction_full(image_path)
@@ -814,7 +803,7 @@ def get_reaction_withatoms_correctR_OS(
         '''
 
         image_file = image_path
-        raw_prediction = model1.predict_image_file(image_file, molnextr=True, ocr=True)
+        raw_prediction = _get_rxnim().predict_image_file(image_file, molnextr=True, ocr=True)
         return raw_prediction
     
     input2 = get_reaction_full(image_path)
