@@ -49,6 +49,23 @@ def _normalize_tool_args(raw_args: Optional[dict], image_path: str) -> dict:
         normalized["image_path"] = image_path
     return normalized
 
+def _normalize_tool_name(raw_name: Optional[str]) -> str:
+    if not isinstance(raw_name, str):
+        return ""
+
+    name = raw_name.strip().strip('"\'')
+    canonical_name = re.sub(r"[\s-]+", "_", name.lower())
+
+    alias_map = {
+        "structure_based_r_group_substitution_agent": "process_reaction_image_with_product_variant_R_group",
+        "text_based_r_group_substitution_agent": "process_reaction_image_with_table_R_group",
+        "reaction_template_parsing_agent": "get_full_reaction_template",
+        "molecular_recognition_agent": "get_multi_molecular_full",
+        "text_extraction_agent": "text_extraction_agent",
+    }
+
+    return alias_map.get(canonical_name, name)
+
 
 def ChemEagle(
     image_path: str,
@@ -274,7 +291,8 @@ def ChemEagle(
 
     # Step 5: 执行工具调用
     for idx, plan_item in enumerate(plan_to_execute):
-        tool_name = plan_item.get("name") or plan_item.get("tool_name")
+        raw_tool_name = plan_item.get("name") or plan_item.get("tool_name")
+        tool_name = _normalize_tool_name(raw_tool_name)
         if not tool_name:
             print(f"warning: plan_item {idx} no name ，skip: {plan_item}")
             continue
@@ -501,7 +519,8 @@ def ChemEagle_OS(
 
     # Step 4: 执行工具调用
     for idx, plan_item in enumerate(plan_to_execute):
-        tool_name = plan_item.get("name") or plan_item.get("tool_name")
+        raw_tool_name = plan_item.get("name") or plan_item.get("tool_name")
+        tool_name = _normalize_tool_name(raw_tool_name)
         if not tool_name:
             print(f"warning: plan_item {idx} no name ，skip: {plan_item}")
             continue
