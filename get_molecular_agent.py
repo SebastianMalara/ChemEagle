@@ -77,18 +77,47 @@ ckpt_path = "./rxn.ckpt"
 model1 = RxnIM(ckpt_path, device=device)
 model = ChemIEToolkit(device=device)
 
-def _get_azure_client() -> AzureOpenAI:
-    api_key = os.getenv("API_KEY") or os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-    azure_endpoint = os.getenv("AZURE_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
-    api_version = os.getenv("API_VERSION", "2024-06-01")
+def _get_azure_client() -> AzureOpenAI | OpenAI:
+    provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
 
-    if not api_key or not azure_endpoint:
-        raise ValueError("Azure mode requires API_KEY (or AZURE_OPENAI_API_KEY/OPENAI_API_KEY) and AZURE_ENDPOINT")
-    return AzureOpenAI(
-        api_key=api_key,
-        api_version=api_version,
-        azure_endpoint=azure_endpoint
-    )
+    if provider == "azure":
+        api_key = os.getenv("API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
+        azure_endpoint = os.getenv("AZURE_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
+        api_version = os.getenv("API_VERSION", "2024-06-01")
+
+        if not api_key or not azure_endpoint:
+            raise ValueError(
+                "Azure provider requires API_KEY (or AZURE_OPENAI_API_KEY) and "
+                "AZURE_ENDPOINT (or AZURE_OPENAI_ENDPOINT)."
+            )
+
+        return AzureOpenAI(
+            api_key=api_key,
+            api_version=api_version,
+            azure_endpoint=azure_endpoint,
+        )
+
+    if provider in {"openai", "openai_compatible", "lmstudio", "local_openai"}:
+        api_key = (
+            os.getenv("OPENAI_API_KEY")
+            or os.getenv("LLM_API_KEY")
+            or os.getenv("VLLM_API_KEY")
+            or os.getenv("API_KEY")
+            or "EMPTY"
+        )
+        base_url = (
+            os.getenv("LLM_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("VLLM_BASE_URL")
+            or os.getenv("LMSTUDIO_BASE_URL")
+        )
+
+        kwargs = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        return OpenAI(**kwargs)
+
+    raise ValueError(f"Unsupported LLM_PROVIDER for cloud mode: {provider}")
 
 def get_multi_molecular(image_path: str) -> list:
     '''Returns a list of reactions extracted from the image.'''
