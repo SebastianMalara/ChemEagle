@@ -23,10 +23,10 @@ import requests
 import os
 from openai import AzureOpenAI
 
-API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise ValueError("Please set API_KEY")
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
+# Optional Azure credentials (used only when LLM-assisted symbol resolution is enabled).
+# Do not hard-fail at import time: OpenAI/local providers should still run without Azure vars.
+API_KEY = os.getenv("API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
 API_VERSION = os.getenv("API_VERSION")
 
 # ========== 外部服务基址 ==========
