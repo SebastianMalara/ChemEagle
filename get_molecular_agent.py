@@ -78,12 +78,12 @@ model1 = RxnIM(ckpt_path, device=device)
 model = ChemIEToolkit(device=device)
 
 def _get_azure_client() -> AzureOpenAI:
-    api_key = os.getenv("API_KEY")
-    azure_endpoint = os.getenv("AZURE_ENDPOINT")
+    api_key = os.getenv("API_KEY") or os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    azure_endpoint = os.getenv("AZURE_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
     api_version = os.getenv("API_VERSION", "2024-06-01")
 
     if not api_key or not azure_endpoint:
-        raise ValueError("Azure mode requires API_KEY and AZURE_ENDPOINT")
+        raise ValueError("Azure mode requires API_KEY (or AZURE_OPENAI_API_KEY/OPENAI_API_KEY) and AZURE_ENDPOINT")
     return AzureOpenAI(
         api_key=api_key,
         api_version=api_version,
