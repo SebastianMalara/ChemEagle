@@ -50,6 +50,30 @@ def _get_runtime_models() -> tuple[ChemIEToolkit, RxnIM]:
     return _RUNTIME_TOOLKIT, _RUNTIME_RXNIM
 
 
+def _normalize_chat_message(message) -> dict:
+    tool_calls_payload = []
+    for tool_call in (getattr(message, "tool_calls", None) or []):
+        function_payload = getattr(tool_call, "function", None)
+        tool_calls_payload.append(
+            {
+                "id": getattr(tool_call, "id", None),
+                "type": getattr(tool_call, "type", "function"),
+                "function": {
+                    "name": getattr(function_payload, "name", None),
+                    "arguments": getattr(function_payload, "arguments", "{}") or "{}",
+                },
+            }
+        )
+
+    payload = {
+        "role": getattr(message, "role", "assistant"),
+        "content": getattr(message, "content", None),
+    }
+    if tool_calls_payload:
+        payload["tool_calls"] = tool_calls_payload
+    return payload
+
+
 
 def _get_azure_client() -> AzureOpenAI | OpenAI:
     provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
@@ -1090,7 +1114,7 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
                     }
                 ]
             },
-            response.choices[0].message,
+            _normalize_chat_message(response.choices[0].message),
             *results
             ],
     }
@@ -1362,7 +1386,7 @@ def process_reaction_image_with_product_variant_R_group_OS(
                     }
                 ]
             },
-            response.choices[0].message,
+            _normalize_chat_message(response.choices[0].message),
             *results
             ],
     }
@@ -1596,7 +1620,7 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
                     }
                 ]
             },
-            response.choices[0].message,
+            _normalize_chat_message(response.choices[0].message),
             function_call_result_message,
         ],
     }
@@ -1860,7 +1884,7 @@ def process_reaction_image_with_table_R_group_OS(
                     }
                 ]
             },
-            response.choices[0].message,
+            _normalize_chat_message(response.choices[0].message),
             function_call_result_message,
         ],
     }
