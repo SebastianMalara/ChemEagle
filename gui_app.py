@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -23,6 +24,7 @@ ENV_KEYS = [
     'ANTHROPIC_API_KEY',
     'VLLM_BASE_URL',
     'VLLM_API_KEY',
+    'CHEMEAGLE_DEVICE',
 ]
 
 
@@ -98,6 +100,7 @@ def run_pipeline(
     anthropic_api_key: str,
     vllm_base_url: str,
     vllm_api_key: str,
+    chemeagle_device: str,
     upload,
     save_env: bool,
 ) -> Tuple[str, str]:
@@ -113,10 +116,21 @@ def run_pipeline(
         'ANTHROPIC_API_KEY': anthropic_api_key,
         'VLLM_BASE_URL': vllm_base_url,
         'VLLM_API_KEY': vllm_api_key,
+        'CHEMEAGLE_DEVICE': chemeagle_device,
     }
 
-    apply_runtime_env(values)
     status_bits = [f"Runtime env applied from form. mode={mode}"]
+
+    provider_norm = (llm_provider or '').strip().lower()
+    if provider_norm in {'openai', 'openai_compatible', 'lmstudio', 'local_openai'}:
+        if not values.get('OPENAI_API_KEY') and values.get('API_KEY'):
+            values['OPENAI_API_KEY'] = values['API_KEY']
+            status_bits.append('OPENAI_API_KEY was empty; using API_KEY as fallback for OpenAI provider.')
+        if not values.get('OPENAI_API_KEY') and values.get('VLLM_API_KEY'):
+            values['OPENAI_API_KEY'] = values['VLLM_API_KEY']
+            status_bits.append('OPENAI_API_KEY was empty; using VLLM_API_KEY as fallback.')
+
+    apply_runtime_env(values)
 
     if save_env:
         status_bits.append(save_env_file(env_path, values))
@@ -137,7 +151,15 @@ def run_pipeline(
         else:
             return '\n'.join(status_bits + [f'Unsupported file type: {suffix}']), '{}'
     except Exception as e:
-        return '\n'.join(status_bits + [f'Pipeline failed: {e}']), '{}'
+        tb = traceback.format_exc()
+        status = '\n'.join(status_bits + [f'Pipeline failed: {e}', '', 'Traceback:', tb])
+        error_payload = {
+            'error': str(e),
+            'traceback': tb,
+            'mode': mode,
+            'file': Path(file_path).name,
+        }
+        return status, json.dumps(error_payload, ensure_ascii=False, indent=2)
 
     return '\n'.join(status_bits + [f'Completed for file: {Path(file_path).name}']), json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -152,6 +174,7 @@ def build_app() -> gr.Blocks:
             env_path = gr.Textbox(label='Env file path', value=str(ENV_FILE_DEFAULT), scale=2)
             save_env = gr.Checkbox(label='Save form values to env file', value=True)
             mode = gr.Radio(['cloud', 'local_os'], value='cloud', label='Run mode')
+            chemeagle_device = gr.Radio(['auto', 'cpu', 'cuda'], value=vals.get('CHEMEAGLE_DEVICE', 'auto'), label='Compute device')
 
         with gr.Accordion('Environment settings', open=True):
             with gr.Row():
@@ -190,6 +213,7 @@ def build_app() -> gr.Blocks:
                 anthropic_api_key,
                 vllm_base_url,
                 vllm_api_key,
+                chemeagle_device,
                 upload,
                 save_env,
             ],

@@ -22,10 +22,22 @@ from get_text_agent import text_extraction_agent, text_extraction_agent_OS
 from llm_wrapper import LLMWrapper
 
 
-model = ChemIEToolkit(device=torch.device('cpu')) 
+def _resolve_device() -> torch.device:
+    pref = os.getenv("CHEMEAGLE_DEVICE", "auto").strip().lower()
+    if pref == "cuda":
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        print("CHEMEAGLE_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
+        return torch.device('cpu')
+    if pref == "auto" and torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
+
+device = _resolve_device()
+model = ChemIEToolkit(device=device)
 ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device=torch.device('cpu'))
-device = torch.device('cpu')
+model1 = RxnIM(ckpt_path, device=device)
 
 
 def _normalize_tool_args(raw_args: Optional[dict], image_path: str) -> dict:
@@ -383,8 +395,7 @@ def ChemEagle_OS(
     # Step 1: 调用 planner 获取 agent 列表
     planner_response = client.chat.completions.create(
         model=model_name,
-        temperature=0,
-        messages=[
+                messages=[
             {'role': 'system', 'content': "You are a chemical image understanding and extraction planning expert.After checking the image, your ONLY task is to SELECT and CALL the most appropriate agents from the list below to best fit the data extraction of the image."},
             {
                 'role': 'user',
@@ -562,8 +573,7 @@ def ChemEagle_OS(
         model=completion_payload["model"],
         messages=completion_payload["messages"],
         #response_format={ 'type': 'json_object' },
-        temperature=0,
-    )
+            )
     print(response)
     
     # 获取原始响应内容
