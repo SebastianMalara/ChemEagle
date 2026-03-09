@@ -119,6 +119,31 @@ def _get_azure_client() -> AzureOpenAI | OpenAI:
 
     raise ValueError(f"Unsupported LLM_PROVIDER for cloud mode: {provider}")
 
+
+def _normalize_chat_message(message):
+    """Convert SDK chat message objects into plain dicts for follow-up requests."""
+    if isinstance(message, dict):
+        return message
+
+    if hasattr(message, "model_dump"):
+        return message.model_dump(mode="json", exclude_none=True, by_alias=True)
+
+    normalized = {"role": getattr(message, "role", "assistant")}
+
+    content = getattr(message, "content", None)
+    if content is not None:
+        normalized["content"] = content
+
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        normalized["tool_calls"] = [
+            tc.model_dump(mode="json", exclude_none=True, by_alias=True)
+            if hasattr(tc, "model_dump") else tc
+            for tc in tool_calls
+        ]
+
+    return normalized
+
 def get_multi_molecular(image_path: str) -> list:
     '''Returns a list of reactions extracted from the image.'''
     # 打开图像文件
@@ -307,7 +332,7 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
                     }
                 ]
             },
-            response.choices[0].message,
+            _normalize_chat_message(response.choices[0].message),
             *results
             ],
     }
@@ -554,7 +579,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
                     }
                 ]
             },
-            response.choices[0].message,
+            _normalize_chat_message(response.choices[0].message),
             *results
             ],
     }
@@ -797,7 +822,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
                     }
                 ]
             },
-            response.choices[0].message,
+            _normalize_chat_message(response.choices[0].message),
             *results
             ],
     }
@@ -1059,7 +1084,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
                     }
                 ]
             },
-            response.choices[0].message,
+            _normalize_chat_message(response.choices[0].message),
             *results
             ],
     }
