@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import traceback
+import gc
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -61,12 +64,65 @@ def apply_runtime_env(values: Dict[str, str]) -> None:
         if v:
             os.environ[k] = v
 
+    # Help reduce CUDA memory fragmentation on small GPUs.
+    # Only set when user hasn't explicitly provided their own allocator config.
+    pref = (values.get('CHEMEAGLE_DEVICE') or '').strip().lower()
+    if pref in {'auto', 'cuda'} and not os.getenv('PYTORCH_CUDA_ALLOC_CONF'):
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 
 def _run_on_image(image_path: str, mode: str) -> dict:
     from main import ChemEagle, ChemEagle_OS
     if mode == 'cloud':
         return ChemEagle(image_path)
     return ChemEagle_OS(image_path)
+
+
+def _run_on_image_cpu_subprocess(image_path: str, mode: str) -> dict:
+    script = (
+        "import json\n"
+        "import traceback\n"
+        "from main import ChemEagle, ChemEagle_OS\n"
+        "fn = ChemEagle if " + repr(mode == 'cloud') + " else ChemEagle_OS\n"
+        "try:\n"
+        "    result = fn(" + repr(image_path) + ")\n"
+        "    print(json.dumps({'ok': True, 'result': result}, ensure_ascii=False))\n"
+        "except Exception as e:\n"
+        "    print(json.dumps({'ok': False, 'error': str(e), 'traceback': traceback.format_exc()}, ensure_ascii=False))\n"
+        "    raise\n"
+    )
+    env = dict(os.environ)
+    env['CHEMEAGLE_DEVICE'] = 'cpu'
+    proc = subprocess.run(
+        [sys.executable, '-c', script],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    if not lines:
+        raise RuntimeError(f"CPU retry produced no output. stderr: {proc.stderr.strip()}")
+
+    payload = json.loads(lines[-1])
+    if not isinstance(payload, dict) or not payload.get('ok'):
+        error = payload.get('error') if isinstance(payload, dict) else 'Unknown CPU retry failure'
+        tb = payload.get('traceback', '') if isinstance(payload, dict) else ''
+        stderr = proc.stderr.strip()
+        raise RuntimeError(f"CPU retry failed: {error}\n{tb}\nSubprocess stderr:\n{stderr}")
+    return payload['result']
+
+
+def _release_gpu_memory() -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, 'ipc_collect'):
+                torch.cuda.ipc_collect()
+    except Exception:
+        pass
+    gc.collect()
 
 
 def _run_on_pdf(pdf_path: str, mode: str) -> List[dict]:
@@ -151,6 +207,14 @@ def run_pipeline(
         else:
             return '\n'.join(status_bits + [f'Unsupported file type: {suffix}']), '{}'
     except Exception as e:
+        if chemeagle_device in {'auto', 'cuda'} and 'cuda out of memory' in str(e).lower() and suffix != '.pdf':
+            status_bits.append('CUDA OOM detected; retrying once on CPU.')
+            try:
+                _release_gpu_memory()
+                result = _run_on_image_cpu_subprocess(file_path, mode)
+                return '\n'.join(status_bits + [f'Completed for file: {Path(file_path).name}']), json.dumps(result, ensure_ascii=False, indent=2)
+            except Exception as cpu_e:
+                e = cpu_e
         tb = traceback.format_exc()
         status = '\n'.join(status_bits + [f'Pipeline failed: {e}', '', 'Traceback:', tb])
         error_payload = {
@@ -160,6 +224,8 @@ def run_pipeline(
             'file': Path(file_path).name,
         }
         return status, json.dumps(error_payload, ensure_ascii=False, indent=2)
+    finally:
+        _release_gpu_memory()
 
     return '\n'.join(status_bits + [f'Completed for file: {Path(file_path).name}']), json.dumps(result, ensure_ascii=False, indent=2)
 
