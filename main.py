@@ -296,13 +296,17 @@ def ChemEagle(
         })
 
         # 保存每个工具调用结果
+        # NOTE: We execute tools locally (without model-emitted tool_calls), so
+        # these must not be sent with role="tool" to OpenAI chat completions.
+        # Instead, inject structured tool outputs as assistant context.
         results.append({
-            'role': 'tool',
+            'role': 'assistant',
             'content': json.dumps({
+                'tool_call_id': tool_call_id,
+                'tool_name': tool_name,
                 'image_path': image_path,
-                f'{tool_name}':(tool_result),
+                'tool_result': tool_result,
             }),
-            'tool_call_id': tool_call_id,
         })
 
     # Action Observer: 检查执行结果，如果失败则重新执行
@@ -524,13 +528,13 @@ def ChemEagle_OS(
             continue
             
         results.append({
-            'role': 'tool',
-            'name': tool_name.strip(),  # OpenAI 兼容 API 标准：工具响应必须包含 name 字段（Qwen/Gemini 都支持）
+            'role': 'assistant',
             'content': json.dumps({
+                'tool_call_id': tool_call_id,
+                'tool_name': tool_name.strip(),
                 'image_path': image_path,
-                tool_name: tool_result,
+                'tool_result': tool_result,
             }),
-            'tool_call_id': tool_call_id,
         })
     
     print(f'[OS_D] results: {results}')
