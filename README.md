@@ -249,6 +249,23 @@ for fname in sorted(os.listdir(output_dir)):
 print(results)
 ```
 
+
+### Self-hosted GUI (local deployment)
+
+A built-in self-hosted GUI is included in `gui_app.py`. It allows you to:
+- load env values from `.env.chemeagle` and edit them in the UI
+- optionally save updated env values back to file
+- upload an image or PDF
+- run the existing pipeline (`ChemEagle` cloud mode or `ChemEagle_OS` local mode)
+
+Start it with:
+
+```bash
+python gui_app.py
+```
+
+Then open: `http://localhost:7860`
+
 ### Benchmarking
 Benchmark datasets, predictions, and ground truth can be found in our [Huggingface Repo](https://huggingface.co/datasets/CYF200127/ChemEagle/blob/main/Dataset.zip).
 
@@ -447,6 +464,14 @@ from main import ChemEagle_OS
 print(ChemEagle_OS('./examples/1.png'))
 PY
 ```
+
+### 7.5) Optional: launch self-hosted GUI
+
+```bash
+python gui_app.py
+```
+
+Open `http://localhost:7860` on your Dell XPS.
 
 ### 8) Run on PDF input
 
