@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import traceback
 from pathlib import Path
@@ -61,12 +63,40 @@ def apply_runtime_env(values: Dict[str, str]) -> None:
         if v:
             os.environ[k] = v
 
+    # Help reduce CUDA memory fragmentation on small GPUs.
+    # Only set when user hasn't explicitly provided their own allocator config.
+    pref = (values.get('CHEMEAGLE_DEVICE') or '').strip().lower()
+    if pref in {'auto', 'cuda'} and not os.getenv('PYTORCH_CUDA_ALLOC_CONF'):
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 
 def _run_on_image(image_path: str, mode: str) -> dict:
     from main import ChemEagle, ChemEagle_OS
     if mode == 'cloud':
         return ChemEagle(image_path)
     return ChemEagle_OS(image_path)
+
+
+def _run_on_image_cpu_subprocess(image_path: str, mode: str) -> dict:
+    script = (
+        "import json\n"
+        "from main import ChemEagle, ChemEagle_OS\n"
+        "fn = ChemEagle if " + repr(mode == 'cloud') + " else ChemEagle_OS\n"
+        "print(json.dumps(fn(" + repr(image_path) + "), ensure_ascii=False))\n"
+    )
+    env = dict(os.environ)
+    env['CHEMEAGLE_DEVICE'] = 'cpu'
+    proc = subprocess.run(
+        [sys.executable, '-c', script],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    if not lines:
+        raise RuntimeError(f"CPU retry produced no output. stderr: {proc.stderr.strip()}")
+    return json.loads(lines[-1])
 
 
 def _run_on_pdf(pdf_path: str, mode: str) -> List[dict]:
@@ -151,6 +181,13 @@ def run_pipeline(
         else:
             return '\n'.join(status_bits + [f'Unsupported file type: {suffix}']), '{}'
     except Exception as e:
+        if chemeagle_device in {'auto', 'cuda'} and 'cuda out of memory' in str(e).lower() and suffix != '.pdf':
+            status_bits.append('CUDA OOM detected; retrying once on CPU.')
+            try:
+                result = _run_on_image_cpu_subprocess(file_path, mode)
+                return '\n'.join(status_bits + [f'Completed for file: {Path(file_path).name}']), json.dumps(result, ensure_ascii=False, indent=2)
+            except Exception as cpu_e:
+                e = cpu_e
         tb = traceback.format_exc()
         status = '\n'.join(status_bits + [f'Pipeline failed: {e}', '', 'Traceback:', tb])
         error_payload = {
