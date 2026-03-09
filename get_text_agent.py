@@ -20,10 +20,17 @@ from openai import InternalServerError, RateLimitError, APIError
 
 
 API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise ValueError("Please set API_KEY")
 AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
 API_VERSION = os.getenv("API_VERSION")
+
+def _get_azure_client() -> AzureOpenAI:
+    if not API_KEY or not AZURE_ENDPOINT:
+        raise ValueError("Azure mode requires API_KEY and AZURE_ENDPOINT")
+    return AzureOpenAI(
+        api_key=API_KEY,
+        api_version=API_VERSION,
+        azure_endpoint=AZURE_ENDPOINT
+    )
 
 
 def configure_tesseract():
@@ -234,11 +241,7 @@ def text_extraction_agent(image_path: str) -> dict:
     to perform OCR, reaction extraction, and chemical NER on a single image.
     Returns a merged JSON result.
     """
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    client = _get_azure_client()
 
     # Encode image as Base64
     with open(image_path, "rb") as f:

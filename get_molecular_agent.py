@@ -66,10 +66,17 @@ device = torch.device('cpu')
 model = ChemIEToolkit(device=torch.device('cpu'))
 
 API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise ValueError("Please set API_KEY")
 AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
 API_VERSION = os.getenv("API_VERSION")
+
+def _get_azure_client() -> AzureOpenAI:
+    if not API_KEY or not AZURE_ENDPOINT:
+        raise ValueError("Azure mode requires API_KEY and AZURE_ENDPOINT")
+    return AzureOpenAI(
+        api_key=API_KEY,
+        api_version=API_VERSION,
+        azure_endpoint=AZURE_ENDPOINT
+    )
 
 def get_multi_molecular(image_path: str) -> list:
     '''Returns a list of reactions extracted from the image.'''
@@ -135,11 +142,7 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
         dict: 整理后的反应数据，包括反应物、产物和反应模板。
     """
 
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    client = _get_azure_client()
 
     # 加载图像并编码为 Base64
     def encode_image(image_path: str):
@@ -388,11 +391,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
     Returns:
         dict: 整理后的反应数据，包括反应物、产物和反应模板。
     """
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    client = _get_azure_client()
 
     # 加载图像并编码为 Base64
     def encode_image(image_path: str):
@@ -637,11 +636,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
     Returns:
         dict: 整理后的反应数据，包括反应物、产物和反应模板。
     """
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    client = _get_azure_client()
 
     # 加载图像并编码为 Base64
     def encode_image(image_path: str):

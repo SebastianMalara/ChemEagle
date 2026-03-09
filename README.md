@@ -295,3 +295,185 @@ The input can be any chemical graphics; feel free to try more examples!
 1. We use api_version="2024-10-21" with the HKUST Azure OpenAI endpoint as our official version.
 2. Our code is based on [MolNexTR](https://github.com/CYF2000127/MolNexTR), [MolScribe](https://github.com/thomas0809/MolScribe), [RxnIM](https://github.com/CYF2000127/RxnIM), [RxnScribe](https://github.com/thomas0809/RxNScribe), [ChemNER](https://github.com/Ozymandias314/ChemIENER), [ChemRxnExtractor](https://github.com/jiangfeng1124/ChemRxnExtractor), [AutoAgents](https://github.com/Link-AGI/AutoAgents), and [Azure OpenAI](https://azure.microsoft.com/).
 
+
+## 🖥️ Dell XPS (Ubuntu + NVIDIA dGPU) deployment guide
+
+### Readiness verdict
+ChemEAGLE is **ready to run on a Dell XPS with Ubuntu and NVIDIA discrete graphics**.
+
+### Recommended target environment
+- Ubuntu 22.04/24.04 LTS
+- NVIDIA proprietary driver with a working `nvidia-smi`
+- Python 3.10
+- Optional for local high-throughput inference: CUDA-compatible stack + vLLM
+
+### 0) Clone repository
+
+```bash
+git clone https://github.com/CYF2000127/ChemEagle
+cd ChemEagle
+```
+
+### 1) Install Ubuntu system packages
+
+```bash
+sudo apt update
+sudo apt install -y \
+  git build-essential python3-dev python3-venv \
+  poppler-utils tesseract-ocr libgl1 libglib2.0-0
+```
+
+Why these packages:
+- `python3-venv` is needed if you use Python venv (recommended alternative to conda).
+- `poppler-utils` is needed by PDF extraction flow (`pdf2image`).
+- `tesseract-ocr` is needed for OCR.
+- `libgl1` and `libglib2.0-0` are often required by OpenCV runtime.
+
+### 2) Verify NVIDIA driver and GPU visibility
+
+```bash
+nvidia-smi
+```
+
+If this fails, fix NVIDIA driver installation first.
+
+### 3) Create Python environment (choose one)
+
+#### Option A: Conda
+
+```bash
+conda create -n chemeagle python=3.10 -y
+conda activate chemeagle
+python -m pip install --upgrade pip setuptools wheel
+```
+
+#### Option B: Python venv
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+```
+
+### 4) Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+Optional (GPU PyTorch wheel, example CUDA 12.1):
+
+```bash
+pip install --upgrade --force-reinstall torch==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+```
+
+Verify torch install:
+
+```bash
+python -c "import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available())"
+```
+
+### 5) Run ChemEAGLE installer (models + env helpers)
+
+Interactive installer:
+
+```bash
+python installer.py
+```
+
+Non-interactive examples:
+
+```bash
+python installer.py --provider openai
+python installer.py --provider azure
+python installer.py --provider anthropic
+python installer.py --model-dir ./models --repos-dir ./external
+```
+
+The installer downloads model files and writes:
+- `.env.chemeagle`
+- `load_chemeagle_env.sh`
+
+Load environment variables:
+
+```bash
+source ./load_chemeagle_env.sh
+```
+
+### 6) Run preflight check before go-live
+
+```bash
+python scripts/preflight_check.py
+```
+
+Preflight verifies platform basics, GPU visibility, and required model/prompt files.
+
+### 7) Start ChemEAGLE
+
+#### Mode A: Cloud LLM mode (`ChemEagle`)
+
+Use one provider configuration (Azure/OpenAI/Anthropic), then run:
+
+```bash
+python - <<'PY'
+from main import ChemEagle
+print(ChemEagle('./examples/1.png'))
+PY
+```
+
+#### Mode B: Local open-source mode (`ChemEagle_OS` + vLLM)
+
+Install and start vLLM:
+
+```bash
+pip install vllm
+vllm serve /path/to/Qwen3-VL-32B-Instruct-AWQ \
+  --port 8000 \
+  --trust-remote-code \
+  --enable-auto-tool-choice \
+  --tool-call-parser hermes \
+  --max-model-len 27200 \
+  --limit-mm-per-prompt video=0
+```
+
+Then run ChemEAGLE_OS:
+
+```bash
+python - <<'PY'
+from main import ChemEagle_OS
+print(ChemEagle_OS('./examples/1.png'))
+PY
+```
+
+### 8) Run on PDF input
+
+```bash
+python - <<'PY'
+import os
+from main import ChemEagle
+from pdf_extraction import run_pdf
+
+pdf_path='your/pdf/path'
+output_dir='your/output/dir'
+run_pdf(pdf_dir=pdf_path, image_dir=output_dir)
+
+results=[]
+for fname in sorted(os.listdir(output_dir)):
+    if fname.lower().endswith('.png'):
+        path=os.path.join(output_dir, fname)
+        out=ChemEagle(path)
+        out['image_name']=fname
+        results.append(out)
+print(results)
+PY
+```
+
+### 9) Go-live troubleshooting checklist
+
+- If `nvidia-smi` fails: reinstall/fix NVIDIA driver.
+- If `python scripts/preflight_check.py` reports missing models: run `python installer.py`.
+- If OpenCV import fails: verify `libgl1` and `libglib2.0-0` are installed.
+- If PDF conversion fails: verify `poppler-utils` is installed and in `PATH`.
+- If OCR quality is poor: verify `tesseract-ocr` and language packs.
+- If local model startup OOMs: use a smaller quantized model, lower context, or use cloud mode.
+
