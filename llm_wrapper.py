@@ -1,7 +1,7 @@
 import os
 from typing import Any, Dict, List, Optional
 
-from openai import AzureOpenAI, OpenAI
+from openai import AzureOpenAI, BadRequestError, OpenAI
 
 try:
     from anthropic import Anthropic
@@ -80,11 +80,12 @@ class LLMWrapper:
             kwargs: Dict[str, Any] = {
                 "model": model,
                 "messages": messages,
-                "temperature": temperature,
             }
+            if temperature is not None:
+                kwargs["temperature"] = temperature
             if response_format is not None:
                 kwargs["response_format"] = response_format
-            response = self.client.chat.completions.create(**kwargs)
+            response = self._create_chat_with_temperature_fallback(kwargs)
             return (response.choices[0].message.content or "").strip()
 
         anthropic_messages, system_prompt = self._to_anthropic_messages(messages)
@@ -104,6 +105,19 @@ class LLMWrapper:
             if getattr(block, "type", None) == "text":
                 output_parts.append(block.text)
         return "\n".join(output_parts).strip()
+
+    def _create_chat_with_temperature_fallback(self, kwargs: Dict[str, Any]):
+        """Retry once without `temperature` for models that only accept default temperature."""
+        try:
+            return self.client.chat.completions.create(**kwargs)
+        except BadRequestError as exc:
+            err = getattr(exc, "body", {}) or {}
+            detail = err.get("error", {}) if isinstance(err, dict) else {}
+            if detail.get("param") == "temperature" and "temperature" in kwargs:
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("temperature", None)
+                return self.client.chat.completions.create(**retry_kwargs)
+            raise
 
     @staticmethod
     def _to_anthropic_messages(messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], str]:
