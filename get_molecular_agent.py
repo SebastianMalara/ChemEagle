@@ -65,17 +65,17 @@ model1 = RxnIM(ckpt_path, device=torch.device('cpu'))
 device = torch.device('cpu')
 model = ChemIEToolkit(device=torch.device('cpu'))
 
-API_KEY = os.getenv("API_KEY")
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
-API_VERSION = os.getenv("API_VERSION")
-
 def _get_azure_client() -> AzureOpenAI:
-    if not API_KEY or not AZURE_ENDPOINT:
+    api_key = os.getenv("API_KEY")
+    azure_endpoint = os.getenv("AZURE_ENDPOINT")
+    api_version = os.getenv("API_VERSION", "2024-06-01")
+
+    if not api_key or not azure_endpoint:
         raise ValueError("Azure mode requires API_KEY and AZURE_ENDPOINT")
     return AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
+        api_key=api_key,
+        api_version=api_version,
+        azure_endpoint=azure_endpoint
     )
 
 def get_multi_molecular(image_path: str) -> list:
@@ -684,7 +684,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
 
     # 调用 GPT 接口
     response = client.chat.completions.create(
-    model = 'gpt-5-mini',
+    model = os.getenv("LLM_MODEL", 'gpt-5-mini'),
     #temperature = 0,
     response_format={ 'type': 'json_object' },
     messages = [
@@ -743,7 +743,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
 
 # Prepare the chat completion payload
     completion_payload = {
-        'model': 'gpt-5-mini',
+        'model': os.getenv("LLM_MODEL", 'gpt-5-mini'),
         'messages': [
             {'role': 'system', 'content': 'You are a helpful assistant.'},
             {
