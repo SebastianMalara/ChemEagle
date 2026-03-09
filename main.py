@@ -58,22 +58,58 @@ def _normalize_tool_args(raw_args: Optional[dict], image_path: str) -> dict:
         normalized["image_path"] = image_path
     return normalized
 
+TOOL_NAME_ALIASES = {
+    "structure_based_r_group_substitution_agent": "process_reaction_image_with_product_variant_R_group",
+    "structure_based_rgroup_substitution_agent": "process_reaction_image_with_product_variant_R_group",
+    "structurebased_rgroupsubstitutionagent": "process_reaction_image_with_product_variant_R_group",
+    "text_based_r_group_substitution_agent": "process_reaction_image_with_table_R_group",
+    "text_based_rgroup_substitution_agent": "process_reaction_image_with_table_R_group",
+    "textbased_rgroupsubstitutionagent": "process_reaction_image_with_table_R_group",
+    "reaction_template_parsing_agent": "get_full_reaction_template",
+    "reactiontemplateparsingagent": "get_full_reaction_template",
+    "molecular_recognition_agent": "get_multi_molecular_full",
+    "molecularrecognitionagent": "get_multi_molecular_full",
+    "text_extraction_agent": "text_extraction_agent",
+    "textextractionagent": "text_extraction_agent",
+}
+
+
 def _normalize_tool_name(raw_name: Optional[str]) -> str:
     if not isinstance(raw_name, str):
         return ""
 
     name = raw_name.strip().strip('"\'')
     canonical_name = re.sub(r"[\s-]+", "_", name.lower())
+    collapsed_name = canonical_name.replace("_", "")
 
-    alias_map = {
-        "structure_based_r_group_substitution_agent": "process_reaction_image_with_product_variant_R_group",
-        "text_based_r_group_substitution_agent": "process_reaction_image_with_table_R_group",
-        "reaction_template_parsing_agent": "get_full_reaction_template",
-        "molecular_recognition_agent": "get_multi_molecular_full",
-        "text_extraction_agent": "text_extraction_agent",
-    }
+    if name in TOOL_NAME_ALIASES.values():
+        return name
+    if canonical_name in TOOL_NAME_ALIASES:
+        return TOOL_NAME_ALIASES[canonical_name]
+    if collapsed_name in TOOL_NAME_ALIASES:
+        return TOOL_NAME_ALIASES[collapsed_name]
+    return canonical_name
 
-    return alias_map.get(canonical_name, name)
+
+def _select_primary_tool(agent_list: list[str]) -> str:
+    normalized_agents = {_normalize_tool_name(agent) for agent in agent_list}
+
+    if "process_reaction_image_with_product_variant_R_group" in normalized_agents:
+        return "process_reaction_image_with_product_variant_R_group"
+    if "process_reaction_image_with_table_R_group" in normalized_agents:
+        return "process_reaction_image_with_table_R_group"
+    if "get_full_reaction_template" in normalized_agents:
+        return "get_full_reaction_template"
+    if "get_multi_molecular_full" in normalized_agents:
+        return "get_multi_molecular_full"
+
+    print("warning: no agents")
+    return "get_full_reaction_template"
+
+
+def _resolve_supported_tool_name(raw_name: Optional[str], tool_map: dict[str, object]) -> str:
+    tool_name = _normalize_tool_name(raw_name)
+    return tool_name if tool_name in tool_map else ""
 
 
 def ChemEagle(
@@ -220,21 +256,8 @@ def ChemEagle(
     print(f"[D] Parsed agents: {agent_list}")
     
     
-    selected_tool = None
+    selected_tool = _select_primary_tool(agent_list)
     agent_names_lower = [agent.lower() for agent in agent_list]
-    
-    if "structure-based r-group substitution agent" in agent_names_lower:
-        selected_tool = "process_reaction_image_with_product_variant_R_group"
-    elif "text-based r-group substitution agent" in agent_names_lower:
-        selected_tool = "process_reaction_image_with_table_R_group"
-    elif "reaction template parsing agent" in agent_names_lower:
-        selected_tool = "get_full_reaction_template"
-    elif "molecular recognition agent" in agent_names_lower:
-        selected_tool = "get_multi_molecular_full"
-    else:
-        # 如果没有匹配的 agent，默认使用 get_full_reaction_template
-        print(f"warning: no agents")
-        selected_tool = "get_full_reaction_template"
     
     print(f"[D] Selected tool: {selected_tool}")
     
@@ -249,7 +272,7 @@ def ChemEagle(
     
     # Step 4: 构建执行计划（支持 observer）
     # 检查是否有 text_extraction_agent
-    has_text_extraction = "text extraction agent" in agent_names_lower or "text_extraction_agent" in agent_names_lower
+    has_text_extraction = any(_normalize_tool_name(agent) == "text_extraction_agent" for agent in agent_list)
     
     serialized_calls = [{
         "id": "tool_call_0",
@@ -274,8 +297,10 @@ def ChemEagle(
         else:
             plan_to_execute = []
             for idx, item in enumerate(reviewed_plan):
-                name = item.get("name") or item.get("tool_name")
-                if not name:
+                raw_name = item.get("name") or item.get("tool_name")
+                tool_name = _resolve_supported_tool_name(raw_name, TOOL_MAP)
+                if not tool_name:
+                    print(f"warning: observer returned unsupported tool {raw_name!r}, skipping")
                     continue
                 args = item.get("arguments", {})
                 if isinstance(args, str):
@@ -286,7 +311,7 @@ def ChemEagle(
                 call_id = item.get("id") or f"observer_call_{idx}"
                 plan_to_execute.append({
                     "id": call_id,
-                    "name": name,
+                    "name": tool_name,
                     "arguments": args,
                 })
             if not plan_to_execute:
@@ -301,9 +326,9 @@ def ChemEagle(
     # Step 5: 执行工具调用
     for idx, plan_item in enumerate(plan_to_execute):
         raw_tool_name = plan_item.get("name") or plan_item.get("tool_name")
-        tool_name = _normalize_tool_name(raw_tool_name)
+        tool_name = _resolve_supported_tool_name(raw_tool_name, TOOL_MAP)
         if not tool_name:
-            print(f"warning: plan_item {idx} no name ，skip: {plan_item}")
+            print(f"warning: plan_item {idx} has unsupported tool, skip: {plan_item}")
             continue
         
         tool_call_id = plan_item.get("id") or f"observer_call_{idx}"
@@ -449,21 +474,8 @@ def ChemEagle_OS(
     agent_list = [agent.strip() for agent in planner_output.split(',') if agent.strip()]
     print(f"[OS_D] Parsed agents: {agent_list}")
     
-    selected_tool = None
+    selected_tool = _select_primary_tool(agent_list)
     agent_names_lower = [agent.lower() for agent in agent_list]
-    
-    if "structure-based r-group substitution agent" in agent_names_lower:
-        selected_tool = "process_reaction_image_with_product_variant_R_group"
-    elif "text-based r-group substitution agent" in agent_names_lower:
-        selected_tool = "process_reaction_image_with_table_R_group"
-    elif "reaction template parsing agent" in agent_names_lower:
-        selected_tool = "get_full_reaction_template"
-    elif "molecular recognition agent" in agent_names_lower:
-        selected_tool = "get_multi_molecular_full"
-    else:
-        # 如果没有匹配的 agent，默认使用 get_full_reaction_template
-        print(f"warning: no agents")
-        selected_tool = "get_full_reaction_template"
     
     print(f"[OS_D] Selected tool: {selected_tool}")
     
@@ -477,7 +489,7 @@ def ChemEagle_OS(
     
     # Step 3: 构建执行计划（支持 observer）
     # 检查是否有 text_extraction_agent
-    has_text_extraction = "text extraction agent" in agent_names_lower or "text_extraction_agent" in agent_names_lower
+    has_text_extraction = any(_normalize_tool_name(agent) == "text_extraction_agent" for agent in agent_list)
     
     serialized_calls = [{
         "id": "tool_call_0",
@@ -502,8 +514,10 @@ def ChemEagle_OS(
         else:
             plan_to_execute = []
             for idx, item in enumerate(reviewed_plan):
-                name = item.get("name") or item.get("tool_name")
-                if not name:
+                raw_name = item.get("name") or item.get("tool_name")
+                tool_name = _resolve_supported_tool_name(raw_name, TOOL_MAP)
+                if not tool_name:
+                    print(f"warning: observer returned unsupported tool {raw_name!r}, skipping")
                     continue
                 args = item.get("arguments", {})
                 if isinstance(args, str):
@@ -514,7 +528,7 @@ def ChemEagle_OS(
                 call_id = item.get("id") or f"observer_call_{idx}"
                 plan_to_execute.append({
                     "id": call_id,
-                    "name": name,
+                    "name": tool_name,
                     "arguments": args,
                 })
             if not plan_to_execute:
@@ -529,9 +543,9 @@ def ChemEagle_OS(
     # Step 4: 执行工具调用
     for idx, plan_item in enumerate(plan_to_execute):
         raw_tool_name = plan_item.get("name") or plan_item.get("tool_name")
-        tool_name = _normalize_tool_name(raw_tool_name)
+        tool_name = _resolve_supported_tool_name(raw_tool_name, TOOL_MAP)
         if not tool_name:
-            print(f"warning: plan_item {idx} no name ，skip: {plan_item}")
+            print(f"warning: plan_item {idx} has unsupported tool, skip: {plan_item}")
             continue
         
         tool_call_id = plan_item.get("id") or f"observer_call_{idx}"

@@ -10,9 +10,7 @@ Detects other molecules in the graphic except in the reaction template, recogniz
 Uses structure panels / variant images to extract R-group values and generate enumerated products from a core scaffold based on structural information.
 4. Text-based R-group substitution agent
 Reads R-group tables and enumerates products or substituents on top of a given core scaffold using text information.
-5. Condition interpretation agent
-Extracts and normalizes reaction conditions (catalysts, reagents, solvent, temperature, time, atmosphere, etc.) from the graphic.
-6. Text extraction agent
+5. Text extraction agent
 Performs chmical NER and text-based reaction extraction on the text description.
 
 Your task is to:
@@ -29,15 +27,15 @@ If there is a reaction scheme, include: Reaction template parsing agent
 If there are additional standalone molecular structures (outside the main reaction template), include: Molecular recognition agent
 If there is an image-based variant panel with full product/substrate molecules per cell (scope/selected examples, usually with yields or labels), include: Structure-based R-group substitution agent
 If there is a text-based R-group table (with R/R1/R2/Ar/X/Y/etc. defining substituents per row), include: Text-based R-group substitution agent
-If there are reaction conditions (conditions line or conditions table: catalyst, solvent, temperature, time, loading, atmosphere, etc.), include: Condition interpretation agent
 If there is descriptive or caption text that can be used for chemical NER and text-based reaction extraction, include: Text extraction agent
+Reaction conditions should be handled within the selected reaction or R-group agent outputs; do not add a separate condition-only agent.
 
 Mutual exclusion rule (VERY IMPORTANT):
 Text-based R-group substitution agent and Structure-based R-group substitution agent MUST NOT be used at the same time.
 If BOTH an image-based variant panel and a text-based R-group table are present in the same graphic, prefer the Structure-based R-group substitution agent and do NOT select the Text-based R-group substitution agent.
 
 General notes:
-You may select any subset of the six agents that is relevant to the components present in the image.
+You may select any subset of the five agents that is relevant to the components present in the image.
 Do NOT select agents that are clearly irrelevant (for example, if there is no reaction scheme, do not call the Reaction template parsing agent).
 
 Output format:
@@ -45,4 +43,4 @@ Return ONLY a comma-separated list of the selected agent names, in the order the
 Do not add any extra text, explanations, code fences, or JSON.
 
 Example (format only):
-{Reaction template parsing agent,  Structure-based R-group substitution agent, Condition interpretation agent}
+{Reaction template parsing agent, Structure-based R-group substitution agent, Text extraction agent}

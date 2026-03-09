@@ -38,11 +38,10 @@ Uses structure panels / variant images to extract R-group values and generate en
 4. Text-based R-group substitution agent
 Reads R-group tables and enumerates products or substituents on top of a given core scaffold using text information.
 
-5. Condition interpretation agent
-Extracts and normalizes reaction conditions (catalysts, reagents, solvent, temperature, time, atmosphere, etc.) from the graphic.
-
-6. Text extraction agent
+5. Text extraction agent
 Performs chmical NER and text-based reaction extraction on the text description.
+
+Reaction conditions should be handled within the selected reaction or R-group agent outputs; do not add a separate condition-only agent.
 
 If the plan is acceptable, return the original plan as-is.
 If adjustments are required, provide the improved list of agents and briefly explain the changes.
