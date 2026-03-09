@@ -107,6 +107,11 @@ def _select_primary_tool(agent_list: list[str]) -> str:
     return "get_full_reaction_template"
 
 
+def _resolve_supported_tool_name(raw_name: Optional[str], tool_map: dict[str, object]) -> str:
+    tool_name = _normalize_tool_name(raw_name)
+    return tool_name if tool_name in tool_map else ""
+
+
 def ChemEagle(
     image_path: str,
     *,
@@ -267,7 +272,7 @@ def ChemEagle(
     
     # Step 4: 构建执行计划（支持 observer）
     # 检查是否有 text_extraction_agent
-    has_text_extraction = "text extraction agent" in agent_names_lower or "text_extraction_agent" in agent_names_lower
+    has_text_extraction = any(_normalize_tool_name(agent) == "text_extraction_agent" for agent in agent_list)
     
     serialized_calls = [{
         "id": "tool_call_0",
@@ -292,8 +297,10 @@ def ChemEagle(
         else:
             plan_to_execute = []
             for idx, item in enumerate(reviewed_plan):
-                name = item.get("name") or item.get("tool_name")
-                if not name:
+                raw_name = item.get("name") or item.get("tool_name")
+                tool_name = _resolve_supported_tool_name(raw_name, TOOL_MAP)
+                if not tool_name:
+                    print(f"warning: observer returned unsupported tool {raw_name!r}, skipping")
                     continue
                 args = item.get("arguments", {})
                 if isinstance(args, str):
@@ -304,7 +311,7 @@ def ChemEagle(
                 call_id = item.get("id") or f"observer_call_{idx}"
                 plan_to_execute.append({
                     "id": call_id,
-                    "name": name,
+                    "name": tool_name,
                     "arguments": args,
                 })
             if not plan_to_execute:
@@ -319,9 +326,9 @@ def ChemEagle(
     # Step 5: 执行工具调用
     for idx, plan_item in enumerate(plan_to_execute):
         raw_tool_name = plan_item.get("name") or plan_item.get("tool_name")
-        tool_name = _normalize_tool_name(raw_tool_name)
+        tool_name = _resolve_supported_tool_name(raw_tool_name, TOOL_MAP)
         if not tool_name:
-            print(f"warning: plan_item {idx} no name ，skip: {plan_item}")
+            print(f"warning: plan_item {idx} has unsupported tool, skip: {plan_item}")
             continue
         
         tool_call_id = plan_item.get("id") or f"observer_call_{idx}"
@@ -482,7 +489,7 @@ def ChemEagle_OS(
     
     # Step 3: 构建执行计划（支持 observer）
     # 检查是否有 text_extraction_agent
-    has_text_extraction = "text extraction agent" in agent_names_lower or "text_extraction_agent" in agent_names_lower
+    has_text_extraction = any(_normalize_tool_name(agent) == "text_extraction_agent" for agent in agent_list)
     
     serialized_calls = [{
         "id": "tool_call_0",
@@ -507,8 +514,10 @@ def ChemEagle_OS(
         else:
             plan_to_execute = []
             for idx, item in enumerate(reviewed_plan):
-                name = item.get("name") or item.get("tool_name")
-                if not name:
+                raw_name = item.get("name") or item.get("tool_name")
+                tool_name = _resolve_supported_tool_name(raw_name, TOOL_MAP)
+                if not tool_name:
+                    print(f"warning: observer returned unsupported tool {raw_name!r}, skipping")
                     continue
                 args = item.get("arguments", {})
                 if isinstance(args, str):
@@ -519,7 +528,7 @@ def ChemEagle_OS(
                 call_id = item.get("id") or f"observer_call_{idx}"
                 plan_to_execute.append({
                     "id": call_id,
-                    "name": name,
+                    "name": tool_name,
                     "arguments": args,
                 })
             if not plan_to_execute:
@@ -534,9 +543,9 @@ def ChemEagle_OS(
     # Step 4: 执行工具调用
     for idx, plan_item in enumerate(plan_to_execute):
         raw_tool_name = plan_item.get("name") or plan_item.get("tool_name")
-        tool_name = _normalize_tool_name(raw_tool_name)
+        tool_name = _resolve_supported_tool_name(raw_tool_name, TOOL_MAP)
         if not tool_name:
-            print(f"warning: plan_item {idx} no name ，skip: {plan_item}")
+            print(f"warning: plan_item {idx} has unsupported tool, skip: {plan_item}")
             continue
         
         tool_call_id = plan_item.get("id") or f"observer_call_{idx}"
