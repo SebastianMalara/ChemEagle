@@ -421,8 +421,7 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
     # 调用 GPT 接口
     response = client.chat.completions.create(
     model = os.getenv("LLM_MODEL", 'gpt-5-mini'),
-    #temperature = 0,
-    response_format={ 'type': 'json_object' },
+    #    response_format={ 'type': 'json_object' },
     messages = [
         {'role': 'system', 'content': 'You are a helpful assistant.'},
         {
@@ -507,7 +506,6 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
         model=completion_payload["model"],
         messages=completion_payload["messages"],
         response_format={ 'type': 'json_object' },
-        #temperature=0
     )
 
 
@@ -645,8 +643,7 @@ def get_reaction_withatoms_correctR_OS(
         base_delay=3,
         backoff_factor=2,
         model=model_name,
-        temperature=0,
-        #response_format={'type': 'json_object'},  # vLLM 不支持同时使用 response_format 和 tools
+                #response_format={'type': 'json_object'},  # vLLM 不支持同时使用 response_format 和 tools
         messages=messages,
         tools=tools,
         tool_choice="auto",
@@ -720,8 +717,7 @@ def get_reaction_withatoms_correctR_OS(
         model=completion_payload["model"],
         messages=completion_payload["messages"],
         #response_format={'type': 'json_object'},  # vLLM 可能不支持
-        temperature=0
-    )
+            )
 
     # 获取 GPT 生成的结果（支持从包含思考过程的文本中提取）
     from get_R_group_sub_agent import extract_json_from_text_with_reasoning

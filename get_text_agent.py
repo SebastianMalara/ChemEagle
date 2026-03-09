@@ -420,8 +420,7 @@ Here is my step-by-step analysis:
         model=model_name,
         messages=messages,
         tools=tools,
-        #temperature=0,
-        response_format={"type": "json_object"}
+        #        response_format={"type": "json_object"}
     )
 
     # Get assistant message with tool calls
@@ -461,8 +460,7 @@ Here is my step-by-step analysis:
         client,
         model=model_name,
         messages=messages,
-        #   temperature=0,
-        response_format={"type": "json_object"}
+        #           response_format={"type": "json_object"}
     )
 
     return json.loads(response2.choices[0].message.content)
@@ -641,8 +639,7 @@ Here is my step-by-step analysis:
             messages=messages,
             tools=tools,
             tool_choice="auto",
-            temperature=0,
-            # response_format={"type": "json_object"},  # vLLM 不支持同时使用 response_format 和 tools
+                        # response_format={"type": "json_object"},  # vLLM 不支持同时使用 response_format 和 tools
         )
     except Exception as e:
         error_msg = str(e)
@@ -710,8 +707,7 @@ Here is my step-by-step analysis:
         backoff_factor=2,
         model=model_name,
         messages=messages,
-        temperature=0,
-        # response_format={"type": "json_object"},  # vLLM 可能不支持
+                # response_format={"type": "json_object"},  # vLLM 可能不支持
     )
 
     # Parse response (support extracting JSON from text with reasoning)

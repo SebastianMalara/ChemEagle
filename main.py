@@ -395,8 +395,7 @@ def ChemEagle_OS(
     # Step 1: 调用 planner 获取 agent 列表
     planner_response = client.chat.completions.create(
         model=model_name,
-        temperature=0,
-        messages=[
+                messages=[
             {'role': 'system', 'content': "You are a chemical image understanding and extraction planning expert.After checking the image, your ONLY task is to SELECT and CALL the most appropriate agents from the list below to best fit the data extraction of the image."},
             {
                 'role': 'user',
@@ -574,8 +573,7 @@ def ChemEagle_OS(
         model=completion_payload["model"],
         messages=completion_payload["messages"],
         #response_format={ 'type': 'json_object' },
-        temperature=0,
-    )
+            )
     print(response)
     
     # 获取原始响应内容
