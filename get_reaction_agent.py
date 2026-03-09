@@ -59,10 +59,17 @@ device = torch.device('cpu')
 model = ChemIEToolkit(device=torch.device('cpu')) 
 
 API_KEY = os.getenv("API_KEY")
-if not API_KEY:
-    raise ValueError("Please set API_KEY")
 AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
 API_VERSION = os.getenv("API_VERSION")
+
+def _get_azure_client() -> AzureOpenAI:
+    if not API_KEY or not AZURE_ENDPOINT:
+        raise ValueError("Azure mode requires API_KEY and AZURE_ENDPOINT")
+    return AzureOpenAI(
+        api_key=API_KEY,
+        api_version=API_VERSION,
+        azure_endpoint=AZURE_ENDPOINT
+    )
 
 
 def get_reaction(image_path: str) -> dict:
@@ -142,11 +149,7 @@ def get_reaction_withatoms(image_path: str) -> dict:
         dict: 整理后的反应数据，包括反应物、产物和反应模板。
     """
     # 初始化 OpenChemIE 模型和 Azure OpenAI 客户端
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    client = _get_azure_client()
 
     # 加载图像并编码为 Base64
     def encode_image(image_path: str):
@@ -360,11 +363,7 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
     # 配置 API Key 和 Azure Endpoint
     
 
-    client = AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
-    )
+    client = _get_azure_client()
 
     # 加载图像并编码为 Base64
     def encode_image(image_path: str):
