@@ -202,8 +202,7 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
 
     # 调用 GPT 接口
     response = client.chat.completions.create(
-    model = 'gpt-4o',
-    temperature = 0,
+    model = os.getenv("LLM_MODEL", 'gpt-5-mini'),
     response_format={ 'type': 'json_object' },
     messages = [
         {'role': 'system', 'content': 'You are a helpful assistant.'},
@@ -261,7 +260,7 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
 
 # Prepare the chat completion payload
     completion_payload = {
-        'model': 'gpt-4o',
+        'model': os.getenv("LLM_MODEL", 'gpt-5-mini'),
         'messages': [
             {'role': 'system', 'content': 'You are a helpful assistant.'},
             {
@@ -289,7 +288,6 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
         model=completion_payload["model"],
         messages=completion_payload["messages"],
         response_format={ 'type': 'json_object' },
-        temperature=0
     )
 
 
@@ -451,8 +449,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
 
     # 调用 GPT 接口
     response = client.chat.completions.create(
-    model = 'gpt-4o',
-    temperature = 0,
+    model = os.getenv("LLM_MODEL", 'gpt-5-mini'),
     response_format={ 'type': 'json_object' },
     messages = [
         {'role': 'system', 'content': 'You are a helpful assistant.'},
@@ -510,7 +507,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
 
 # Prepare the chat completion payload
     completion_payload = {
-        'model': 'gpt-4o',
+        'model': os.getenv("LLM_MODEL", 'gpt-5-mini'),
         'messages': [
             {'role': 'system', 'content': 'You are a helpful assistant.'},
             {
@@ -538,7 +535,6 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
         model=completion_payload["model"],
         messages=completion_payload["messages"],
         response_format={ 'type': 'json_object' },
-        temperature=0
     )
 
 

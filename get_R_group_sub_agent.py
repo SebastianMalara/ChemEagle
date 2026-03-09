@@ -12,10 +12,23 @@ import sys
 from rxnim import RxnIM
 import json
 import base64
-model = ChemIEToolkit(device=torch.device('cpu')) 
+import os
+def _resolve_device() -> torch.device:
+    pref = os.getenv("CHEMEAGLE_DEVICE", "auto").strip().lower()
+    if pref == "cuda":
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        print("CHEMEAGLE_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
+        return torch.device('cpu')
+    if pref == "auto" and torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
+
+device = _resolve_device()
+model = ChemIEToolkit(device=device)
 ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device=torch.device('cpu'))
-device = torch.device('cpu')
+model1 = RxnIM(ckpt_path, device=device)
 import base64
 import torch
 import json

@@ -208,8 +208,7 @@ def get_reaction_withatoms(image_path: str) -> dict:
 
     # 调用 GPT 接口
     response = client.chat.completions.create(
-    model = 'gpt-4o',
-    temperature = 0,
+    model = os.getenv("LLM_MODEL", 'gpt-5-mini'),
     response_format={ 'type': 'json_object' },
     messages = [
         {'role': 'system', 'content': 'You are a helpful assistant.'},
@@ -267,7 +266,7 @@ def get_reaction_withatoms(image_path: str) -> dict:
 
 # Prepare the chat completion payload
     completion_payload = {
-        'model': 'gpt-4o',
+        'model': os.getenv("LLM_MODEL", 'gpt-5-mini'),
         'messages': [
             {'role': 'system', 'content': 'You are a helpful assistant.'},
             {
@@ -295,7 +294,6 @@ def get_reaction_withatoms(image_path: str) -> dict:
         model=completion_payload["model"],
         messages=completion_payload["messages"],
         response_format={ 'type': 'json_object' },
-        temperature=0
     )
 
 
