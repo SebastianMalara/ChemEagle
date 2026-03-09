@@ -36,13 +36,17 @@ class LLMWrapper:
             base_url = (
                 os.getenv("LLM_BASE_URL")
                 or os.getenv("OPENAI_BASE_URL")
+                or os.getenv("VLLM_BASE_URL")
                 or os.getenv("LMSTUDIO_BASE_URL")
+                or os.getenv("OLLAMA_BASE_URL")
             )
             api_key = (
                 os.getenv("LLM_API_KEY")
                 or os.getenv("OPENAI_API_KEY")
+                or os.getenv("VLLM_API_KEY")
                 or os.getenv("API_KEY")
                 or os.getenv("LMSTUDIO_API_KEY")
+                or os.getenv("OLLAMA_API_KEY")
             )
 
             # OpenAI cloud needs API key; local compatible servers often accept any non-empty key.

@@ -1,24 +1,36 @@
-from PIL import Image
-import pytesseract
-from chemrxnextractor import RxnExtractor
-from openai import AzureOpenAI, OpenAI
-from typing import Optional
-model_dir = "./cre_models_v0.1"
-import json
-import torch
-from chemiener import ChemNER
-from huggingface_hub import hf_hub_download
-ckpt_path = "./ner.ckpt"
+from __future__ import annotations
+
 import base64
+import json
+import mimetypes
 import os
-import shutil
 import re
+import shutil
 import time
-from openai import InternalServerError, RateLimitError, APIError
-from runtime_device import resolve_torch_device, warn_once
+from typing import Any, Optional
+
+import pytesseract
+from PIL import Image
+from chemiener import ChemNER
+from chemrxnextractor import RxnExtractor
+from huggingface_hub import hf_hub_download
+from openai import APIError, AzureOpenAI, InternalServerError, OpenAI, RateLimitError
+
+from llm_wrapper import LLMWrapper
+from runtime_device import (
+    easyocr_uses_acceleration,
+    resolve_ocr_backend,
+    resolve_torch_device,
+    warn_once,
+)
+
+model_dir = "./cre_models_v0.1"
+ckpt_path = "./ner.ckpt"
 
 _CHEMNER_MODELS: dict[str, ChemNER] = {}
 _RXN_EXTRACTORS: dict[str, RxnExtractor] = {}
+_EASYOCR_READERS: dict[tuple[tuple[str, ...], str], Any] = {}
+_OCR_TEXT_CACHE: dict[tuple[str, ...], str] = {}
 
 def _get_azure_client() -> AzureOpenAI | OpenAI:
     provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
@@ -64,6 +76,10 @@ def _get_azure_client() -> AzureOpenAI | OpenAI:
 
 def _resolve_text_agent_model(default_model: str = "gpt-5-mini") -> str:
     return os.getenv("TEXT_AGENT_MODEL") or os.getenv("LLM_MODEL") or default_model
+
+
+def _resolve_ocr_llm_model(default_model: str = "gpt-5-mini") -> str:
+    return os.getenv("OCR_LLM_MODEL") or _resolve_text_agent_model(default_model)
 
 
 def _get_text_agent_client() -> OpenAI:
@@ -115,70 +131,101 @@ def _get_chemner_model() -> ChemNER:
     return _CHEMNER_MODELS[cache_key]
 
 
-def configure_tesseract() -> bool:
-    """自动检测并配置 Tesseract OCR 可执行文件路径"""
-    # 如果已经配置过，直接返回
-    if hasattr(pytesseract.pytesseract, 'tesseract_cmd') and pytesseract.pytesseract.tesseract_cmd:
-        if os.path.exists(pytesseract.pytesseract.tesseract_cmd):
-            return True
+def find_tesseract_cmd() -> str | None:
+    current_cmd = getattr(pytesseract.pytesseract, "tesseract_cmd", "")
+    if current_cmd and os.path.exists(current_cmd):
+        return current_cmd
 
     env_tesseract_cmd = os.getenv("TESSERACT_CMD") or os.getenv("CHEMEAGLE_TESSERACT_CMD")
     if env_tesseract_cmd:
         normalized_env_cmd = os.path.normpath(env_tesseract_cmd)
         if os.path.exists(normalized_env_cmd):
-            pytesseract.pytesseract.tesseract_cmd = normalized_env_cmd
-            print(f"✓ 使用环境变量中的 Tesseract: {normalized_env_cmd}")
-            return True
-    
-    # 常见的 Windows 安装路径（包括项目目录下的自定义路径）
+            return normalized_env_cmd
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     possible_paths = [
-        # 用户指定的绝对路径（最高优先级）
-        r"F:\chemeagle\Tesseract-OCR\tesseract.exe",
-        # 项目目录下的自定义路径
+        shutil.which("tesseract"),
         os.path.join(script_dir, "Tesseract-OCR", "tesseract.exe"),
         os.path.join(os.path.dirname(script_dir), "Tesseract-OCR", "tesseract.exe"),
-        # 标准安装路径
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
         os.path.expanduser(r"~\AppData\Local\Tesseract-OCR\tesseract.exe"),
         r"C:\Users\Administrator\AppData\Local\Tesseract-OCR\tesseract.exe",
     ]
-    
-    # 首先尝试从 PATH 中查找
-    try:
-        tesseract_cmd = shutil.which("tesseract")
-        if tesseract_cmd and os.path.exists(tesseract_cmd):
-            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-            print(f"✓ 从 PATH 中找到 Tesseract: {tesseract_cmd}")
-            return True
-    except Exception:
-        pass
-    
-    # 如果 PATH 中没有，尝试常见路径
+
     for path in possible_paths:
-        # 规范化路径
+        if not path:
+            continue
         normalized_path = os.path.normpath(path)
         if os.path.exists(normalized_path):
-            pytesseract.pytesseract.tesseract_cmd = normalized_path
-            print(f"✓ 找到 Tesseract: {normalized_path}")
-            return True
-    
-    # 如果都没找到，提示用户
-    print("⚠️  警告: 未找到 Tesseract OCR 可执行文件")
-    print("已尝试的路径:")
-    for path in possible_paths:
-        normalized_path = os.path.normpath(path)
-        exists = "✓" if os.path.exists(normalized_path) else "✗"
-        print(f"  {exists} {normalized_path}")
-    print("\n请执行以下步骤之一:")
-    print("1. 确保 Tesseract OCR 已正确安装")
-    print("2. 或者手动设置路径:")
-    print("   pytesseract.pytesseract.tesseract_cmd = r'F:\\chemeagle\\Tesseract-OCR\\tesseract.exe'")
-    return False
+            return normalized_path
+    return None
 
 
-def _ocr_image_to_text(image_path: str) -> str:
+def configure_tesseract() -> bool:
+    tesseract_cmd = find_tesseract_cmd()
+    if not tesseract_cmd:
+        warn_once("Tesseract OCR executable was not found. Select EasyOCR or LLM vision, or set TESSERACT_CMD.")
+        return False
+
+    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    return True
+
+
+def _normalize_ocr_text(raw_text: str) -> str:
+    return "\n".join(line.rstrip() for line in raw_text.splitlines()).strip()
+
+
+def _paragraph_from_raw_text(raw_text: str) -> str:
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    return " ".join(lines).strip()
+
+
+def _parse_ocr_langs_for_easyocr() -> list[str]:
+    raw_lang = (os.getenv("OCR_LANG") or "eng").strip()
+    mapping = {
+        "eng": "en",
+        "chi_sim": "ch_sim",
+        "chi_tra": "ch_tra",
+        "deu": "de",
+        "fra": "fr",
+        "spa": "es",
+        "ita": "it",
+        "por": "pt",
+        "rus": "ru",
+        "jpn": "ja",
+        "kor": "ko",
+    }
+
+    langs: list[str] = []
+    for token in re.split(r"[+,;\s]+", raw_lang):
+        normalized = token.strip().lower()
+        if not normalized:
+            continue
+        langs.append(mapping.get(normalized, normalized))
+    return langs or ["en"]
+
+
+def _get_easyocr_reader():
+    import easyocr
+
+    device = resolve_torch_device()
+    use_gpu = easyocr_uses_acceleration(device)
+    cache_key = (tuple(_parse_ocr_langs_for_easyocr()), device.type if use_gpu else "cpu")
+
+    if cache_key not in _EASYOCR_READERS:
+        _EASYOCR_READERS[cache_key] = easyocr.Reader(
+            list(cache_key[0]),
+            gpu=use_gpu,
+            verbose=False,
+        )
+    return _EASYOCR_READERS[cache_key]
+
+
+def _ocr_text_via_tesseract(image_path: str) -> str:
+    if not configure_tesseract():
+        raise RuntimeError("Tesseract OCR unavailable. Install Tesseract or set TESSERACT_CMD.")
+
     img = Image.open(image_path)
     lang = os.getenv("OCR_LANG", "eng")
     config = os.getenv("OCR_CONFIG", "").strip()
@@ -186,6 +233,67 @@ def _ocr_image_to_text(image_path: str) -> str:
     if config:
         kwargs["config"] = config
     return pytesseract.image_to_string(img, **kwargs)
+
+
+def _ocr_text_via_easyocr(image_path: str) -> str:
+    reader = _get_easyocr_reader()
+    results = reader.readtext(image_path, detail=0, paragraph=False)
+    return "\n".join(str(item).strip() for item in results if str(item).strip())
+
+
+def _ocr_text_via_llm_vision(image_path: str) -> str:
+    model_name = _resolve_ocr_llm_model()
+    mime_type = mimetypes.guess_type(image_path)[0] or "image/png"
+
+    with open(image_path, "rb") as handle:
+        b64_image = base64.b64encode(handle.read()).decode("utf-8")
+
+    llm = LLMWrapper.from_env(default_model=model_name)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an OCR engine for chemistry documents. Return only the text visible in the image. "
+                "Preserve useful line breaks. Do not explain, summarize, or infer missing content."
+            ),
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Extract the text from this image. Return raw text only."},
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64_image}"}},
+            ],
+        },
+    ]
+    return llm.chat_completion_text(messages, model=model_name, temperature=0)
+
+
+def _extract_image_text(image_path: str) -> tuple[str, str]:
+    backend = resolve_ocr_backend()
+    cache_key = (
+        os.path.abspath(image_path),
+        backend,
+        os.getenv("OCR_LANG", ""),
+        os.getenv("OCR_CONFIG", ""),
+        os.getenv("OCR_LLM_MODEL", ""),
+        os.getenv("LLM_MODEL", ""),
+    )
+
+    if cache_key in _OCR_TEXT_CACHE:
+        return _OCR_TEXT_CACHE[cache_key], backend
+
+    if backend == "tesseract":
+        raw_text = _ocr_text_via_tesseract(image_path)
+    elif backend == "easyocr":
+        raw_text = _ocr_text_via_easyocr(image_path)
+    elif backend == "llm_vision":
+        raw_text = _ocr_text_via_llm_vision(image_path)
+    else:
+        raise ValueError(f"Unsupported OCR_BACKEND: {backend}")
+
+    normalized = _normalize_ocr_text(raw_text)
+    _OCR_TEXT_CACHE[cache_key] = normalized
+    return normalized, backend
 
 
 def _chat_completion_with_json_fallback(client, **kwargs):
@@ -367,73 +475,63 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
         'reactions': RxnExtractor 输出的反应列表 (list)
       }
     """
-    if not configure_tesseract():
-        return {"error": "Tesseract OCR unavailable. Install Tesseract and ensure it is in PATH."}
+    try:
+        raw_text, backend = _extract_image_text(image_path)
+    except Exception as e:
+        return {"error": f"OCR unavailable: {e}"}
 
-    # 模型目录和设备参数（可按需修改）
-    model_dir = "./cre_models_v0.1"
-    device = "cpu"
-
-    # 1. OCR 提取文本
-    raw_text = _ocr_image_to_text(image_path)
-
-    # 2. 将多行文本合并为单段落
-    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-    paragraph = " ".join(lines)
-
-    # 3. 将文本分割成句子，避免长度问题
+    paragraph = _paragraph_from_raw_text(raw_text)
     sentences = split_text_into_sentences(paragraph)
-    
-    # 4. 初始化化学反应提取器
+
     try:
         rxn_extractor = _get_rxn_extractor()
     except Exception as e:
         return {"error": f"RxnExtractor unavailable: {e}"}
 
-    # 5. 对每个句子提取反应（避免长度不匹配问题）
     all_reactions = []
     try:
         reactions = rxn_extractor.get_reactions(sentences)
         all_reactions = reactions
     except AssertionError as e:
-        # 如果还是出错，尝试逐个句子处理
-        print(f"警告: 批量处理失败，尝试逐个句子处理: {e}")
+        print(f"Warning: batch reaction extraction failed, retrying sentence-by-sentence: {e}")
         all_reactions = []
         for sent in sentences:
             try:
                 sent_reactions = rxn_extractor.get_reactions([sent])
                 all_reactions.extend(sent_reactions)
             except Exception as sent_e:
-                print(f"警告: 跳过句子（处理失败）: {sent[:50]}... 错误: {sent_e}")
+                print(f"Warning: skipping sentence after extraction failure: {sent[:50]}... error: {sent_e}")
                 continue
 
-    return all_reactions 
+    return {
+        "ocr_backend": backend,
+        "raw_text": raw_text,
+        "paragraph": paragraph,
+        "sentences": sentences,
+        "reactions": all_reactions,
+    }
 
 def NER_from_text_in_image(image_path: str) -> dict:
-    if not configure_tesseract():
-        return {"error": "Tesseract OCR unavailable. Install Tesseract and ensure it is in PATH."}
+    try:
+        raw_text, backend = _extract_image_text(image_path)
+    except Exception as e:
+        return {"error": f"OCR unavailable: {e}"}
 
-    # 模型目录和设备参数（可按需修改）
-    model_dir = "./cre_models_v0.1"
-    device = "cpu"
+    paragraph = _paragraph_from_raw_text(raw_text)
 
-    # 1. OCR 提取文本
-    raw_text = _ocr_image_to_text(image_path)
-
-    # 2. 将多行文本合并为单段落
-    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-    paragraph = " ".join(lines)
-
-    # 3. 初始化化学命名实体识别器
     try:
         model2 = _get_chemner_model()
     except Exception as e:
         return {"error": f"ChemNER unavailable: {e}"}
 
-    # 4. 提取命名实体
     predictions = model2.predict_strings([paragraph])
 
-    return predictions 
+    return {
+        "ocr_backend": backend,
+        "raw_text": raw_text,
+        "paragraph": paragraph,
+        "entities": predictions,
+    }
 
 
 

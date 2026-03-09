@@ -36,6 +36,25 @@ def easyocr_uses_acceleration(device: torch.device) -> bool:
     return device.type in {"cuda", "mps"}
 
 
+def resolve_ocr_backend(
+    requested_backend: str | None = None,
+    run_mode: str | None = None,
+) -> str:
+    backend = (requested_backend or os.getenv("OCR_BACKEND") or "auto").strip().lower()
+    mode = (run_mode or os.getenv("CHEMEAGLE_RUN_MODE") or "cloud").strip().lower()
+
+    aliases = {
+        "vision": "llm_vision",
+        "llm": "llm_vision",
+        "easy_ocr": "easyocr",
+    }
+    backend = aliases.get(backend, backend)
+
+    if backend == "auto":
+        return "llm_vision" if mode == "cloud" else "easyocr"
+    return backend
+
+
 def warn_once(message: str) -> None:
     if message in _WARNED_MESSAGES:
         return
