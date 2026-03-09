@@ -164,6 +164,31 @@ def _chat_completion_with_json_fallback(client, **kwargs):
         raise
 
 
+def _assistant_message_to_dict(message) -> dict:
+    """Convert SDK message objects into plain dicts safe for re-submission."""
+    tool_calls_payload = []
+    for tool_call in (getattr(message, "tool_calls", None) or []):
+        function_payload = getattr(tool_call, "function", None)
+        tool_calls_payload.append(
+            {
+                "id": getattr(tool_call, "id", None),
+                "type": getattr(tool_call, "type", "function"),
+                "function": {
+                    "name": getattr(function_payload, "name", None),
+                    "arguments": getattr(function_payload, "arguments", "{}") or "{}",
+                },
+            }
+        )
+
+    payload = {
+        "role": getattr(message, "role", "assistant"),
+        "content": getattr(message, "content", None),
+    }
+    if tool_calls_payload:
+        payload["tool_calls"] = tool_calls_payload
+    return payload
+
+
 def merge_sentences(sentences):
     """
     合并一个句子片段列表为一个连贯的段落字符串。
@@ -453,7 +478,7 @@ Here is my step-by-step analysis:
 
     # Second API call: pass tool outputs back to GPT for final response
     # Add assistant message and tool results to messages
-    messages.append(assistant_message)
+    messages.append(_assistant_message_to_dict(assistant_message))
     messages.extend(tool_results_msgs)
     
     response2 = _chat_completion_with_json_fallback(
@@ -697,7 +722,7 @@ Here is my step-by-step analysis:
 
     # Second API call: pass tool outputs back to GPT for final response
     # Add assistant message and tool results to messages
-    messages.append(assistant_message)
+    messages.append(_assistant_message_to_dict(assistant_message))
     messages.extend(tool_results_msgs)
     
     response2 = retry_api_call(
