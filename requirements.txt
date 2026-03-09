@@ -21,7 +21,7 @@ huggingface-hub>=0.11.0
 easyocr>=1.6.2
 cairosvg
 PyPDF2
-pdfminer
+pdfminer.six==20221105
 pdf2image
 pytesseract
 safetensors
