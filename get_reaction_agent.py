@@ -11,7 +11,7 @@ from rxnim import RxnIM
 import json
 from molnextr.chemistry import _convert_graph_to_smiles
 
-from openai import AzureOpenAI, OpenAI, InternalServerError, RateLimitError, APIError
+from openai import OpenAI
 import base64
 import numpy as np
 from chemietoolkit import utils
@@ -19,6 +19,7 @@ from PIL import Image
 import os
 from typing import Optional
 import time
+from llm_wrapper import LLMWrapper
 from runtime_device import resolve_torch_device
 
 def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
@@ -27,13 +28,13 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
     for attempt in range(max_retries):
         try:
             return func(*args, **kwargs)
-        except (InternalServerError, RateLimitError, APIError) as e:
+        except Exception as e:
             last_exception = e
             error_code = getattr(e, 'status_code', None) or getattr(e, 'code', None)
             error_message = str(e)
             
-            # 检查是否是 503 错误或其他可重试的错误
-            if error_code == 503 or 'overloaded' in error_message.lower() or '503' in error_message:
+            # Retry transient provider errors across OpenAI-compatible and Anthropic clients.
+            if error_code in {429, 500, 502, 503, 529} or 'overloaded' in error_message.lower() or '503' in error_message or 'rate limit' in error_message.lower():
                 if attempt < max_retries - 1:
                     delay = base_delay * (backoff_factor ** attempt)
                     print(f"⚠️ API 调用失败 (503/过载)，第 {attempt + 1}/{max_retries} 次尝试。{delay:.1f} 秒后重试...")
@@ -45,8 +46,7 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
             else:
                 # 其他类型的错误，直接抛出
                 raise
-        except Exception as e:
-            # 其他未知错误，直接抛出
+        except BaseException:
             raise
     
     # 如果所有重试都失败了
@@ -68,47 +68,8 @@ def _get_rxnim() -> RxnIM:
         print(f"[ChemEagle] Reaction agent runtime using {device.type.upper()}.")
     return _RUNTIME_RXNIM
 
-def _get_azure_client() -> AzureOpenAI | OpenAI:
-    provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
-
-    if provider == "azure":
-        api_key = os.getenv("API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
-        azure_endpoint = os.getenv("AZURE_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_version = os.getenv("API_VERSION", "2024-06-01")
-
-        if not api_key or not azure_endpoint:
-            raise ValueError(
-                "Azure provider requires API_KEY (or AZURE_OPENAI_API_KEY) and "
-                "AZURE_ENDPOINT (or AZURE_OPENAI_ENDPOINT)."
-            )
-
-        return AzureOpenAI(
-            api_key=api_key,
-            api_version=api_version,
-            azure_endpoint=azure_endpoint,
-        )
-
-    if provider in {"openai", "openai_compatible", "lmstudio", "local_openai"}:
-        api_key = (
-            os.getenv("OPENAI_API_KEY")
-            or os.getenv("LLM_API_KEY")
-            or os.getenv("VLLM_API_KEY")
-            or os.getenv("API_KEY")
-            or "EMPTY"
-        )
-        base_url = (
-            os.getenv("LLM_BASE_URL")
-            or os.getenv("OPENAI_BASE_URL")
-            or os.getenv("VLLM_BASE_URL")
-            or os.getenv("LMSTUDIO_BASE_URL")
-        )
-
-        kwargs = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        return OpenAI(**kwargs)
-
-    raise ValueError(f"Unsupported LLM_PROVIDER for cloud mode: {provider}")
+def _get_azure_client():
+    return LLMWrapper.from_env(default_model=os.getenv("LLM_MODEL") or "gpt-5-mini").as_chat_completion_client()
 
 
 def _normalize_chat_message(message):

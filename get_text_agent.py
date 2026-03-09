@@ -14,7 +14,7 @@ from PIL import Image
 from chemiener import ChemNER
 from chemrxnextractor import RxnExtractor
 from huggingface_hub import hf_hub_download
-from openai import APIError, AzureOpenAI, InternalServerError, OpenAI, RateLimitError
+from openai import OpenAI
 
 from llm_wrapper import LLMWrapper
 from runtime_device import (
@@ -32,47 +32,8 @@ _RXN_EXTRACTORS: dict[str, RxnExtractor] = {}
 _EASYOCR_READERS: dict[tuple[tuple[str, ...], str], Any] = {}
 _OCR_TEXT_CACHE: dict[tuple[str, ...], str] = {}
 
-def _get_azure_client() -> AzureOpenAI | OpenAI:
-    provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
-
-    if provider == "azure":
-        api_key = os.getenv("API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
-        azure_endpoint = os.getenv("AZURE_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_version = os.getenv("API_VERSION", "2024-06-01")
-
-        if not api_key or not azure_endpoint:
-            raise ValueError(
-                "Azure provider requires API_KEY (or AZURE_OPENAI_API_KEY) and "
-                "AZURE_ENDPOINT (or AZURE_OPENAI_ENDPOINT)."
-            )
-
-        return AzureOpenAI(
-            api_key=api_key,
-            api_version=api_version,
-            azure_endpoint=azure_endpoint,
-        )
-
-    if provider in {"openai", "openai_compatible", "lmstudio", "local_openai"}:
-        api_key = (
-            os.getenv("OPENAI_API_KEY")
-            or os.getenv("LLM_API_KEY")
-            or os.getenv("VLLM_API_KEY")
-            or os.getenv("API_KEY")
-            or "EMPTY"
-        )
-        base_url = (
-            os.getenv("LLM_BASE_URL")
-            or os.getenv("OPENAI_BASE_URL")
-            or os.getenv("VLLM_BASE_URL")
-            or os.getenv("LMSTUDIO_BASE_URL")
-        )
-
-        kwargs = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        return OpenAI(**kwargs)
-
-    raise ValueError(f"Unsupported LLM_PROVIDER for cloud mode: {provider}")
+def _get_azure_client():
+    return LLMWrapper.from_env(default_model=os.getenv("LLM_MODEL") or "gpt-5-mini").as_chat_completion_client()
 
 def _resolve_text_agent_model(default_model: str = "gpt-5-mini") -> str:
     return os.getenv("TEXT_AGENT_MODEL") or os.getenv("LLM_MODEL") or default_model
@@ -82,29 +43,8 @@ def _resolve_ocr_llm_model(default_model: str = "gpt-5-mini") -> str:
     return os.getenv("OCR_LLM_MODEL") or _resolve_text_agent_model(default_model)
 
 
-def _get_text_agent_client() -> OpenAI:
-    provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
-
-    if provider == "azure":
-        return _get_azure_client()
-
-    api_key = (
-        os.getenv("OPENAI_API_KEY")
-        or os.getenv("VLLM_API_KEY")
-        or os.getenv("OLLAMA_API_KEY")
-        or os.getenv("API_KEY")
-        or "EMPTY"
-    )
-    base_url = (
-        os.getenv("OPENAI_BASE_URL")
-        or os.getenv("VLLM_BASE_URL")
-        or os.getenv("OLLAMA_BASE_URL")
-    )
-
-    kwargs = {"api_key": api_key}
-    if base_url:
-        kwargs["base_url"] = base_url
-    return OpenAI(**kwargs)
+def _get_text_agent_client():
+    return LLMWrapper.from_env(default_model=_resolve_text_agent_model()).as_chat_completion_client()
 
 
 def _get_rxn_extractor() -> RxnExtractor:
@@ -248,7 +188,7 @@ def _ocr_text_via_llm_vision(image_path: str) -> str:
     with open(image_path, "rb") as handle:
         b64_image = base64.b64encode(handle.read()).decode("utf-8")
 
-    llm = LLMWrapper.from_env(default_model=model_name)
+    llm = LLMWrapper.from_env(default_model=model_name, scope="ocr")
     messages = [
         {
             "role": "system",
@@ -713,13 +653,13 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
     for attempt in range(max_retries):
         try:
             return func(*args, **kwargs)
-        except (InternalServerError, RateLimitError, APIError) as e:
+        except Exception as e:
             last_exception = e
             error_code = getattr(e, 'status_code', None) or getattr(e, 'code', None)
             error_message = str(e)
             
-            # 检查是否是 503 错误或其他可重试的错误
-            if error_code == 503 or 'overloaded' in error_message.lower() or '503' in error_message:
+            # Retry transient provider errors across OpenAI-compatible and Anthropic clients.
+            if error_code in {429, 500, 502, 503, 529} or 'overloaded' in error_message.lower() or '503' in error_message or 'rate limit' in error_message.lower():
                 if attempt < max_retries - 1:
                     delay = base_delay * (backoff_factor ** attempt)
                     print(f"⚠️ API 调用失败 (503/过载)，第 {attempt + 1}/{max_retries} 次尝试。{delay:.1f} 秒后重试...")
@@ -731,8 +671,7 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
             else:
                 # 其他类型的错误，直接抛出
                 raise
-        except Exception as e:
-            # 其他未知错误，直接抛出
+        except BaseException:
             raise
     
     # 如果所有重试都失败了

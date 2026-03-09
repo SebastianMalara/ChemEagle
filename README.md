@@ -255,6 +255,9 @@ print(results)
 A built-in self-hosted GUI is included in `gui_app.py`. It allows you to:
 - load env values from `.env.chemeagle` and edit them in the UI
 - optionally save updated env values back to file
+- refresh provider model catalogs for OpenAI, Anthropic, and compatible `/models` endpoints while still allowing manual model strings
+- keep a separate LLM vision OCR profile, or inherit the main profile by default
+- run a precheck for OCR, provider config, and PDF extraction before execution
 - upload an image or PDF
 - run the existing pipeline (`ChemEagle` cloud mode or `ChemEagle_OS` local mode)
 
@@ -264,7 +267,7 @@ Start it with:
 python gui_app.py
 ```
 
-Then open: `http://localhost:7860`
+By default it binds to `http://127.0.0.1:7860` and enables `share=True`. You can override that with `GRADIO_SERVER_NAME` and `GRADIO_SHARE`.
 
 ### Benchmarking
 Benchmark datasets, predictions, and ground truth can be found in our [Huggingface Repo](https://huggingface.co/datasets/CYF200127/ChemEagle/blob/main/Dataset.zip).
@@ -343,7 +346,7 @@ sudo apt install -y \
 Why these packages:
 - `python3-venv` is needed if you use Python venv (recommended alternative to conda).
 - `poppler-utils` is needed by PDF extraction flow (`pdf2image`).
-- `tesseract-ocr` is needed for OCR.
+- `tesseract-ocr` is only needed if you want the explicit Tesseract fallback backend.
 - `libgl1` and `libglib2.0-0` are often required by OpenCV runtime.
 
 ### 2) Verify NVIDIA driver and GPU visibility
