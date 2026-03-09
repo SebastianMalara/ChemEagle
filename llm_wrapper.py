@@ -72,7 +72,7 @@ class LLMWrapper:
         *,
         model: Optional[str] = None,
         response_format: Optional[Dict[str, Any]] = None,
-        temperature: float = 0,
+        temperature: Optional[float] = None,
     ) -> str:
         model = model or self.model
 
@@ -93,8 +93,9 @@ class LLMWrapper:
             "model": model,
             "messages": anthropic_messages,
             "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2048")),
-            "temperature": temperature,
         }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
         if system_prompt:
             kwargs["system"] = system_prompt
 
@@ -111,13 +112,21 @@ class LLMWrapper:
         try:
             return self.client.chat.completions.create(**kwargs)
         except BadRequestError as exc:
-            err = getattr(exc, "body", {}) or {}
-            detail = err.get("error", {}) if isinstance(err, dict) else {}
-            if detail.get("param") == "temperature" and "temperature" in kwargs:
+            if self._is_temperature_error(exc) and "temperature" in kwargs:
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("temperature", None)
                 return self.client.chat.completions.create(**retry_kwargs)
             raise
+
+    @staticmethod
+    def _is_temperature_error(exc: BadRequestError) -> bool:
+        err = getattr(exc, "body", {}) or {}
+        detail = err.get("error", {}) if isinstance(err, dict) else {}
+        if detail.get("param") == "temperature":
+            return True
+
+        msg = str(exc).lower()
+        return "temperature" in msg and "unsupported" in msg
 
     @staticmethod
     def _to_anthropic_messages(messages: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], str]:
