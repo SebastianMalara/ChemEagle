@@ -22,10 +22,22 @@ from get_text_agent import text_extraction_agent, text_extraction_agent_OS
 from llm_wrapper import LLMWrapper
 
 
-model = ChemIEToolkit(device=torch.device('cpu')) 
+def _resolve_device() -> torch.device:
+    pref = os.getenv("CHEMEAGLE_DEVICE", "auto").strip().lower()
+    if pref == "cuda":
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        print("CHEMEAGLE_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
+        return torch.device('cpu')
+    if pref == "auto" and torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
+
+device = _resolve_device()
+model = ChemIEToolkit(device=device)
 ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device=torch.device('cpu'))
-device = torch.device('cpu')
+model1 = RxnIM(ckpt_path, device=device)
 
 
 def _normalize_tool_args(raw_args: Optional[dict], image_path: str) -> dict:

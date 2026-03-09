@@ -12,10 +12,23 @@ import sys
 from rxnim import RxnIM
 import json
 import base64
-model = ChemIEToolkit(device=torch.device('cpu')) 
+import os
+def _resolve_device() -> torch.device:
+    pref = os.getenv("CHEMEAGLE_DEVICE", "auto").strip().lower()
+    if pref == "cuda":
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        print("CHEMEAGLE_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
+        return torch.device('cpu')
+    if pref == "auto" and torch.cuda.is_available():
+        return torch.device('cuda')
+    return torch.device('cpu')
+
+
+device = _resolve_device()
+model = ChemIEToolkit(device=device)
 ckpt_path = "./rxn.ckpt"
-model1 = RxnIM(ckpt_path, device=torch.device('cpu'))
-device = torch.device('cpu')
+model1 = RxnIM(ckpt_path, device=device)
 import base64
 import torch
 import json
@@ -33,17 +46,17 @@ from openai import InternalServerError, RateLimitError, APIError
 
 
 
-API_KEY = os.getenv("API_KEY")
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
-API_VERSION = os.getenv("API_VERSION")
-
 def _get_azure_client() -> AzureOpenAI:
-    if not API_KEY or not AZURE_ENDPOINT:
+    api_key = os.getenv("API_KEY")
+    azure_endpoint = os.getenv("AZURE_ENDPOINT")
+    api_version = os.getenv("API_VERSION", "2024-06-01")
+
+    if not api_key or not azure_endpoint:
         raise ValueError("Azure mode requires API_KEY and AZURE_ENDPOINT")
     return AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
+        api_key=api_key,
+        api_version=api_version,
+        azure_endpoint=azure_endpoint
     )
 
 
@@ -959,7 +972,7 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
 
     # 调用 GPT 接口
     response = client.chat.completions.create(
-    model = 'gpt-5-mini',
+    model = os.getenv("LLM_MODEL", 'gpt-5-mini'),
     #temperature = 0,
     response_format={ 'type': 'json_object' },
     messages = [
@@ -1023,7 +1036,7 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
     
 # Prepare the chat completion payload
     completion_payload = {
-        'model': 'gpt-5-mini',
+        'model': os.getenv("LLM_MODEL", 'gpt-5-mini'),
         'messages': [
             {'role': 'system', 'content': 'You are a helpful assistant.'},
             {
@@ -1479,7 +1492,7 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
 
     
     response = client.chat.completions.create(
-    model = 'gpt-5-mini',
+    model = os.getenv("LLM_MODEL", 'gpt-5-mini'),
     #temperature = 0,
     response_format={ 'type': 'json_object' },
     messages = [
@@ -1531,7 +1544,7 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
 
 
     completion_payload = {
-        'model': 'gpt-5-mini',
+        'model': os.getenv("LLM_MODEL", 'gpt-5-mini'),
         'messages': [
             {'role': 'system', 'content': 'You are a helpful assistant.'},
             {
