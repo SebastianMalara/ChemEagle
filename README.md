@@ -299,103 +299,120 @@ The input can be any chemical graphics; feel free to try more examples!
 ## 🖥️ Dell XPS (Ubuntu + NVIDIA dGPU) deployment guide
 
 ### Readiness verdict
-ChemEAGLE is **ready to run on a Dell XPS with Ubuntu and NVIDIA discrete graphics**, with two practical notes:
-
-1. The repository defaults core inference objects to CPU for stability, so GPU acceleration is optional and primarily relevant when running the local `ChemEagle_OS` path with a local vLLM model server.
-2. A planner prompt path mismatch has been corrected in `main.py` (`prompt_plan.txt` is now used), so the default planner step no longer points to a missing file.
+ChemEAGLE is **ready to run on a Dell XPS with Ubuntu and NVIDIA discrete graphics**.
 
 ### Recommended target environment
 - Ubuntu 22.04/24.04 LTS
-- NVIDIA proprietary driver + working `nvidia-smi`
-- Python 3.10 (Conda env recommended)
+- NVIDIA proprietary driver with a working `nvidia-smi`
+- Python 3.10
 - Optional for local high-throughput inference: CUDA-compatible stack + vLLM
 
-### 0) Fast preflight (recommended before go-live)
-
-Run the built-in preflight checker:
+### 0) Clone repository
 
 ```bash
-python scripts/preflight_check.py
+git clone https://github.com/CYF2000127/ChemEagle
+cd ChemEagle
 ```
 
-This verifies platform basics, GPU visibility (`nvidia-smi`), and required local model/prompt files.
-
-### 1) System preparation on Ubuntu
+### 1) Install Ubuntu system packages
 
 ```bash
 sudo apt update
-sudo apt install -y git build-essential python3-dev poppler-utils tesseract-ocr libgl1 libglib2.0-0
+sudo apt install -y \
+  git build-essential python3-dev python3-venv \
+  poppler-utils tesseract-ocr libgl1 libglib2.0-0
 ```
 
 Why these packages:
-- `poppler-utils` is required by PDF image extraction flows (`pdf2image`).
-- `tesseract-ocr` is used by OCR pipelines.
-- `libgl1`/`libglib2.0-0` are commonly needed by OpenCV on headless Ubuntu systems.
+- `python3-venv` is needed if you use Python venv (recommended alternative to conda).
+- `poppler-utils` is needed by PDF extraction flow (`pdf2image`).
+- `tesseract-ocr` is needed for OCR.
+- `libgl1` and `libglib2.0-0` are often required by OpenCV runtime.
 
-### 2) Verify NVIDIA GPU availability
+### 2) Verify NVIDIA driver and GPU visibility
 
 ```bash
 nvidia-smi
 ```
 
-If this command fails, install/repair NVIDIA drivers before continuing.
+If this fails, fix NVIDIA driver installation first.
 
-### 3) Clone and create environment
+### 3) Create Python environment (choose one)
+
+#### Option A: Conda
 
 ```bash
-git clone https://github.com/CYF2000127/ChemEagle
-cd ChemEagle
 conda create -n chemeagle python=3.10 -y
 conda activate chemeagle
+python -m pip install --upgrade pip setuptools wheel
+```
+
+#### Option B: Python venv
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
 ```
 
 ### 4) Install Python dependencies
-
-Install base dependencies first:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-If you want GPU-enabled PyTorch for local workloads, reinstall torch from the official CUDA index that matches your driver/CUDA runtime (example for CUDA 12.1):
+Optional (GPU PyTorch wheel, example CUDA 12.1):
 
 ```bash
 pip install --upgrade --force-reinstall torch==2.2.0 --index-url https://download.pytorch.org/whl/cu121
 ```
 
-Verify torch sees CUDA:
+Verify torch install:
 
 ```bash
 python -c "import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available())"
 ```
 
-### 5) Download models and configure provider
+### 5) Run ChemEAGLE installer (models + env helpers)
 
-Use the built-in installer:
+Interactive installer:
 
 ```bash
 python installer.py
 ```
 
-This downloads required checkpoints and creates `.env.chemeagle` + `load_chemeagle_env.sh`.
+Non-interactive examples:
 
-Load env vars:
+```bash
+python installer.py --provider openai
+python installer.py --provider azure
+python installer.py --provider anthropic
+python installer.py --model-dir ./models --repos-dir ./external
+```
+
+The installer downloads model files and writes:
+- `.env.chemeagle`
+- `load_chemeagle_env.sh`
+
+Load environment variables:
 
 ```bash
 source ./load_chemeagle_env.sh
 ```
 
-### 6) Choose runtime mode
+### 6) Run preflight check before go-live
+
+```bash
+python scripts/preflight_check.py
+```
+
+Preflight verifies platform basics, GPU visibility, and required model/prompt files.
+
+### 7) Start ChemEAGLE
 
 #### Mode A: Cloud LLM mode (`ChemEagle`)
 
-Set one provider:
-
-- Azure OpenAI: `LLM_PROVIDER=azure` (+ endpoint/key/version/model)
-- OpenAI: `LLM_PROVIDER=openai` (+ `OPENAI_API_KEY`)
-- Anthropic: `LLM_PROVIDER=anthropic` (+ `ANTHROPIC_API_KEY`)
-
-Run:
+Use one provider configuration (Azure/OpenAI/Anthropic), then run:
 
 ```bash
 python - <<'PY'
@@ -406,7 +423,7 @@ PY
 
 #### Mode B: Local open-source mode (`ChemEagle_OS` + vLLM)
 
-Install and start vLLM (Linux):
+Install and start vLLM:
 
 ```bash
 pip install vllm
@@ -419,7 +436,7 @@ vllm serve /path/to/Qwen3-VL-32B-Instruct-AWQ \
   --limit-mm-per-prompt video=0
 ```
 
-Then run:
+Then run ChemEAGLE_OS:
 
 ```bash
 python - <<'PY'
@@ -428,7 +445,7 @@ print(ChemEagle_OS('./examples/1.png'))
 PY
 ```
 
-### 7) Run on PDF input
+### 8) Run on PDF input
 
 ```bash
 python - <<'PY'
@@ -451,11 +468,12 @@ print(results)
 PY
 ```
 
-### 8) Dell XPS troubleshooting checklist
+### 9) Go-live troubleshooting checklist
 
-- If OpenCV import fails: ensure `libgl1` and `libglib2.0-0` are installed.
-- If PDF conversion fails: ensure `poppler-utils` is installed and in `PATH`.
-- If OCR quality is poor: verify `tesseract-ocr` installation and language packs.
-- If GPU is not used: verify `torch.cuda.is_available()` and that vLLM is running with NVIDIA runtime.
-- If local model startup OOMs: use a smaller quantized model, reduce max context, or run cloud mode.
+- If `nvidia-smi` fails: reinstall/fix NVIDIA driver.
+- If `python scripts/preflight_check.py` reports missing models: run `python installer.py`.
+- If OpenCV import fails: verify `libgl1` and `libglib2.0-0` are installed.
+- If PDF conversion fails: verify `poppler-utils` is installed and in `PATH`.
+- If OCR quality is poor: verify `tesseract-ocr` and language packs.
+- If local model startup OOMs: use a smaller quantized model, lower context, or use cloud mode.
 
