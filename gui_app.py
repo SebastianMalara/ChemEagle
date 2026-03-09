@@ -2,6 +2,7 @@
 import json
 import os
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -150,7 +151,15 @@ def run_pipeline(
         else:
             return '\n'.join(status_bits + [f'Unsupported file type: {suffix}']), '{}'
     except Exception as e:
-        return '\n'.join(status_bits + [f'Pipeline failed: {e}']), '{}'
+        tb = traceback.format_exc()
+        status = '\n'.join(status_bits + [f'Pipeline failed: {e}', '', 'Traceback:', tb])
+        error_payload = {
+            'error': str(e),
+            'traceback': tb,
+            'mode': mode,
+            'file': Path(file_path).name,
+        }
+        return status, json.dumps(error_payload, ensure_ascii=False, indent=2)
 
     return '\n'.join(status_bits + [f'Completed for file: {Path(file_path).name}']), json.dumps(result, ensure_ascii=False, indent=2)
 
