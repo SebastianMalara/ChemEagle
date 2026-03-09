@@ -350,12 +350,15 @@ python -m pip install --upgrade pip setuptools wheel
 #### Option B: Python venv
 
 ```bash
-python3 -m venv .venv
+python3.10 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
 ```
 
 ### 4) Install Python dependencies
+
+> ⚠️ **Important:** This repository is currently pinned for **Python 3.10**.
+> If you use Python 3.12/3.13, `pip install -r requirements.txt` may fail (for example with `torch==2.2.0` not found).
 
 ```bash
 pip install -r requirements.txt
@@ -472,6 +475,7 @@ PY
 
 - If `nvidia-smi` fails: reinstall/fix NVIDIA driver.
 - If `python scripts/preflight_check.py` reports missing models: run `python installer.py`.
+- If `pip install -r requirements.txt` fails with `No matching distribution found for torch==2.2.0`, you are likely on Python 3.12/3.13. Recreate the env with Python 3.10 and reinstall.
 - If OpenCV import fails: verify `libgl1` and `libglib2.0-0` are installed.
 - If PDF conversion fails: verify `poppler-utils` is installed and in `PATH`.
 - If OCR quality is poor: verify `tesseract-ocr` and language packs.

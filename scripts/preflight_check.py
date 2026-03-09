@@ -38,6 +38,13 @@ def main():
 
     ok_all = True
 
+
+    py = sys.version_info
+    if (py.major, py.minor) != (3, 10):
+        ok_all = False
+        print(f"[WARN] Unsupported Python {py.major}.{py.minor}. Use Python 3.10 for this repo (torch==2.2.0 and pinned deps).")
+        print("[HINT] Recreate env with: python3.10 -m venv .venv  (or conda create -n chemeagle python=3.10)")
+
     if platform.system() != "Linux":
         ok_all = False
         print("[WARN] Non-Linux platform detected; guide targets Ubuntu.")
