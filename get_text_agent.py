@@ -20,18 +20,35 @@ from openai import InternalServerError, RateLimitError, APIError
 _CHEMNER_MODEL = None
 
 def _get_azure_client() -> AzureOpenAI:
-    api_key = os.getenv("API_KEY")
-    azure_endpoint = os.getenv("AZURE_ENDPOINT")
-    api_version = os.getenv("API_VERSION")
-
-    if not api_key or not azure_endpoint:
-        raise ValueError("Azure mode requires API_KEY and AZURE_ENDPOINT")
-    return AzureOpenAI(
-        api_key=api_key,
-        api_version=api_version,
-        azure_endpoint=azure_endpoint
+    api_key = os.getenv("API_KEY") or os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    azure_endpoint = (
+        os.getenv("AZURE_ENDPOINT")
+        or os.getenv("AZURE_OPENAI_ENDPOINT")
+        or os.getenv("OPENAI_BASE_URL")
     )
+    api_version = os.getenv("API_VERSION", "2024-06-01")
 
+    if api_key and azure_endpoint:
+        return AzureOpenAI(
+            api_key=api_key,
+            api_version=api_version,
+            azure_endpoint=azure_endpoint
+        )
+
+    # Backward-compatible fallback: if Azure endpoint is not configured but an OpenAI-compatible
+    # API key/base URL is available, use OpenAI client so cloud pipeline does not hard-fail.
+    openai_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
+    openai_base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("VLLM_BASE_URL")
+    if openai_api_key or openai_base_url:
+        kwargs = {"api_key": openai_api_key or "EMPTY"}
+        if openai_base_url:
+            kwargs["base_url"] = openai_base_url
+        return OpenAI(**kwargs)
+
+    raise ValueError(
+        "Cloud mode requires either Azure config (API_KEY/AZURE_OPENAI_API_KEY + AZURE_ENDPOINT/AZURE_OPENAI_ENDPOINT) "
+        "or OpenAI-compatible config (OPENAI_API_KEY + OPENAI_BASE_URL)."
+    )
 
 def _resolve_text_agent_model(default_model: str = "gpt-5-mini") -> str:
     return os.getenv("TEXT_AGENT_MODEL") or os.getenv("LLM_MODEL") or default_model
