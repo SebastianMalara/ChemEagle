@@ -506,3 +506,75 @@ PY
 - If OCR quality is poor: verify `tesseract-ocr` and language packs.
 - If local model startup OOMs: use a smaller quantized model, lower context, or use cloud mode.
 
+## 🍎 Apple Silicon (M1/M2/M3) deployment guide (uv + MPS/Metal)
+
+This section is for running ChemEAGLE on Apple Silicon Macs (for example, M1 Pro) using **uv-managed virtual environments**.
+
+### 0) Clone repository
+
+```bash
+git clone https://github.com/CYF2000127/ChemEagle
+cd ChemEagle
+```
+
+### 1) Install system dependencies
+
+Install Homebrew if needed, then:
+
+```bash
+brew install tesseract poppler
+```
+
+Why:
+- `tesseract` is needed for OCR.
+- `poppler` is needed for PDF to image conversion (`pdf2image`).
+
+### 2) Create a Python 3.10 environment with uv
+
+> ⚠️ ChemEAGLE dependencies are pinned around Python 3.10.
+
+```bash
+uv python install 3.10
+uv venv --python 3.10 .venv
+source .venv/bin/activate
+```
+
+### 3) Install Apple Silicon requirements (Metal-enabled PyTorch)
+
+Use the dedicated requirements file:
+
+```bash
+uv pip install -r requirements.apple-silicon.txt
+```
+
+### 4) Verify Metal (MPS) is visible to PyTorch
+
+```bash
+python -c "import torch; print('torch', torch.__version__); print('mps_built', torch.backends.mps.is_built()); print('mps_available', torch.backends.mps.is_available())"
+```
+
+Expected: `mps_built=True` and (typically) `mps_available=True`.
+
+### 5) Install models and configure LLM provider
+
+```bash
+python installer.py
+source ./load_chemeagle_env.sh
+```
+
+### 6) Run a quick smoke test
+
+```bash
+python - <<'PY'
+from main import ChemEagle
+print(ChemEagle('./examples/1.png'))
+PY
+```
+
+### 7) Optional: run GUI locally
+
+```bash
+python gui_app.py
+```
+
+Then open `http://localhost:7860` in your browser.
