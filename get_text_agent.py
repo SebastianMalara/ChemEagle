@@ -4,13 +4,11 @@ from chemrxnextractor import RxnExtractor
 from openai import AzureOpenAI, OpenAI
 from typing import Optional
 model_dir = "./cre_models_v0.1"
-rxn_extractor = RxnExtractor(model_dir)
 import json
 import torch
 from chemiener import ChemNER
 from huggingface_hub import hf_hub_download
 ckpt_path = "./ner.ckpt"
-model2 = ChemNER(ckpt_path, device=torch.device('cpu'))
 import base64
 import os
 import shutil
@@ -19,26 +17,82 @@ import time
 from openai import InternalServerError, RateLimitError, APIError
 
 
-API_KEY = os.getenv("API_KEY")
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT")
-API_VERSION = os.getenv("API_VERSION")
+_CHEMNER_MODEL = None
 
 def _get_azure_client() -> AzureOpenAI:
-    if not API_KEY or not AZURE_ENDPOINT:
+    api_key = os.getenv("API_KEY")
+    azure_endpoint = os.getenv("AZURE_ENDPOINT")
+    api_version = os.getenv("API_VERSION")
+
+    if not api_key or not azure_endpoint:
         raise ValueError("Azure mode requires API_KEY and AZURE_ENDPOINT")
     return AzureOpenAI(
-        api_key=API_KEY,
-        api_version=API_VERSION,
-        azure_endpoint=AZURE_ENDPOINT
+        api_key=api_key,
+        api_version=api_version,
+        azure_endpoint=azure_endpoint
     )
 
 
-def configure_tesseract():
+def _resolve_text_agent_model(default_model: str = "gpt-5-mini") -> str:
+    return os.getenv("TEXT_AGENT_MODEL") or os.getenv("LLM_MODEL") or default_model
+
+
+def _get_text_agent_client() -> OpenAI:
+    provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
+
+    if provider == "azure":
+        return _get_azure_client()
+
+    api_key = (
+        os.getenv("OPENAI_API_KEY")
+        or os.getenv("VLLM_API_KEY")
+        or os.getenv("OLLAMA_API_KEY")
+        or os.getenv("API_KEY")
+        or "EMPTY"
+    )
+    base_url = (
+        os.getenv("OPENAI_BASE_URL")
+        or os.getenv("VLLM_BASE_URL")
+        or os.getenv("OLLAMA_BASE_URL")
+    )
+
+    kwargs = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return OpenAI(**kwargs)
+
+
+def _get_rxn_extractor() -> RxnExtractor:
+    return RxnExtractor(model_dir, use_cuda=False)
+
+
+def _get_chemner_model() -> ChemNER:
+    global _CHEMNER_MODEL
+    if _CHEMNER_MODEL is not None:
+        return _CHEMNER_MODEL
+
+    local_ckpt_path = ckpt_path
+    if not os.path.exists(local_ckpt_path):
+        local_ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "ner.ckpt")
+
+    _CHEMNER_MODEL = ChemNER(local_ckpt_path, device=torch.device('cpu'))
+    return _CHEMNER_MODEL
+
+
+def configure_tesseract() -> bool:
     """自动检测并配置 Tesseract OCR 可执行文件路径"""
     # 如果已经配置过，直接返回
     if hasattr(pytesseract.pytesseract, 'tesseract_cmd') and pytesseract.pytesseract.tesseract_cmd:
         if os.path.exists(pytesseract.pytesseract.tesseract_cmd):
-            return
+            return True
+
+    env_tesseract_cmd = os.getenv("TESSERACT_CMD") or os.getenv("CHEMEAGLE_TESSERACT_CMD")
+    if env_tesseract_cmd:
+        normalized_env_cmd = os.path.normpath(env_tesseract_cmd)
+        if os.path.exists(normalized_env_cmd):
+            pytesseract.pytesseract.tesseract_cmd = normalized_env_cmd
+            print(f"✓ 使用环境变量中的 Tesseract: {normalized_env_cmd}")
+            return True
     
     # 常见的 Windows 安装路径（包括项目目录下的自定义路径）
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -61,7 +115,7 @@ def configure_tesseract():
         if tesseract_cmd and os.path.exists(tesseract_cmd):
             pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
             print(f"✓ 从 PATH 中找到 Tesseract: {tesseract_cmd}")
-            return
+            return True
     except Exception:
         pass
     
@@ -72,7 +126,7 @@ def configure_tesseract():
         if os.path.exists(normalized_path):
             pytesseract.pytesseract.tesseract_cmd = normalized_path
             print(f"✓ 找到 Tesseract: {normalized_path}")
-            return
+            return True
     
     # 如果都没找到，提示用户
     print("⚠️  警告: 未找到 Tesseract OCR 可执行文件")
@@ -85,13 +139,29 @@ def configure_tesseract():
     print("1. 确保 Tesseract OCR 已正确安装")
     print("2. 或者手动设置路径:")
     print("   pytesseract.pytesseract.tesseract_cmd = r'F:\\chemeagle\\Tesseract-OCR\\tesseract.exe'")
-    raise FileNotFoundError(
-        "Tesseract OCR 未安装或不在 PATH 中。"
-        "请访问 https://github.com/UB-Mannheim/tesseract/wiki 下载安装。"
-    )
+    return False
 
-# 初始化 Tesseract 配置
-configure_tesseract()
+
+def _ocr_image_to_text(image_path: str) -> str:
+    img = Image.open(image_path)
+    lang = os.getenv("OCR_LANG", "eng")
+    config = os.getenv("OCR_CONFIG", "").strip()
+    kwargs = {"lang": lang}
+    if config:
+        kwargs["config"] = config
+    return pytesseract.image_to_string(img, **kwargs)
+
+
+def _chat_completion_with_json_fallback(client, **kwargs):
+    try:
+        return client.chat.completions.create(**kwargs)
+    except Exception as e:
+        error_text = str(e).lower()
+        if "response_format" in error_text:
+            fallback_kwargs = dict(kwargs)
+            fallback_kwargs.pop("response_format", None)
+            return client.chat.completions.create(**fallback_kwargs)
+        raise
 
 
 def merge_sentences(sentences):
@@ -170,13 +240,15 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
         'reactions': RxnExtractor 输出的反应列表 (list)
       }
     """
+    if not configure_tesseract():
+        return {"error": "Tesseract OCR unavailable. Install Tesseract and ensure it is in PATH."}
+
     # 模型目录和设备参数（可按需修改）
     model_dir = "./cre_models_v0.1"
     device = "cpu"
 
     # 1. OCR 提取文本
-    img = Image.open(image_path)
-    raw_text = pytesseract.image_to_string(img)
+    raw_text = _ocr_image_to_text(image_path)
 
     # 2. 将多行文本合并为单段落
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
@@ -186,8 +258,10 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
     sentences = split_text_into_sentences(paragraph)
     
     # 4. 初始化化学反应提取器
-    use_cuda = (device.lower() == "cuda")
-    rxn_extractor = RxnExtractor(model_dir, use_cuda=use_cuda)
+    try:
+        rxn_extractor = _get_rxn_extractor()
+    except Exception as e:
+        return {"error": f"RxnExtractor unavailable: {e}"}
 
     # 5. 对每个句子提取反应（避免长度不匹配问题）
     all_reactions = []
@@ -209,23 +283,27 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
     return all_reactions 
 
 def NER_from_text_in_image(image_path: str) -> dict:
+    if not configure_tesseract():
+        return {"error": "Tesseract OCR unavailable. Install Tesseract and ensure it is in PATH."}
+
     # 模型目录和设备参数（可按需修改）
     model_dir = "./cre_models_v0.1"
     device = "cpu"
 
     # 1. OCR 提取文本
-    img = Image.open(image_path)
-    raw_text = pytesseract.image_to_string(img)
+    raw_text = _ocr_image_to_text(image_path)
 
     # 2. 将多行文本合并为单段落
     lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
     paragraph = " ".join(lines)
 
-    # 3. 初始化化学反应提取器
-    use_cuda = (device.lower() == "cuda")
-    rxn_extractor = RxnExtractor(model_dir, use_cuda=use_cuda)
+    # 3. 初始化化学命名实体识别器
+    try:
+        model2 = _get_chemner_model()
+    except Exception as e:
+        return {"error": f"ChemNER unavailable: {e}"}
 
-    # 4. 提取反应（注意 get_reactions 需要列表输入）
+    # 4. 提取命名实体
     predictions = model2.predict_strings([paragraph])
 
     return predictions 
@@ -241,7 +319,8 @@ def text_extraction_agent(image_path: str) -> dict:
     to perform OCR, reaction extraction, and chemical NER on a single image.
     Returns a merged JSON result.
     """
-    client = _get_azure_client()
+    client = _get_text_agent_client()
+    model_name = _resolve_text_agent_model()
 
     # Encode image as Base64
     with open(image_path, "rb") as f:
@@ -336,12 +415,12 @@ Here is my step-by-step analysis:
     ]
 
     # First API call: let GPT decide which tools to invoke
-    response1 = client.chat.completions.create(
-        model="gpt-5-mini",
+    response1 = _chat_completion_with_json_fallback(
+        client,
+        model=model_name,
         messages=messages,
         tools=tools,
-        #temperature=0,
-        response_format={"type": "json_object"}
+        #        response_format={"type": "json_object"}
     )
 
     # Get assistant message with tool calls
@@ -377,11 +456,11 @@ Here is my step-by-step analysis:
     messages.append(assistant_message)
     messages.extend(tool_results_msgs)
     
-    response2 = client.chat.completions.create(
-        model="gpt-5-mini",
+    response2 = _chat_completion_with_json_fallback(
+        client,
+        model=model_name,
         messages=messages,
-        #   temperature=0,
-        response_format={"type": "json_object"}
+        #           response_format={"type": "json_object"}
     )
 
     return json.loads(response2.choices[0].message.content)
@@ -560,8 +639,7 @@ Here is my step-by-step analysis:
             messages=messages,
             tools=tools,
             tool_choice="auto",
-            temperature=0,
-            # response_format={"type": "json_object"},  # vLLM 不支持同时使用 response_format 和 tools
+                        # response_format={"type": "json_object"},  # vLLM 不支持同时使用 response_format 和 tools
         )
     except Exception as e:
         error_msg = str(e)
@@ -629,8 +707,7 @@ Here is my step-by-step analysis:
         backoff_factor=2,
         model=model_name,
         messages=messages,
-        temperature=0,
-        # response_format={"type": "json_object"},  # vLLM 可能不支持
+                # response_format={"type": "json_object"},  # vLLM 可能不支持
     )
 
     # Parse response (support extracting JSON from text with reasoning)
@@ -653,4 +730,3 @@ Here is my step-by-step analysis:
         print(f"⚠️ 警告: 无法解析 JSON，返回原始内容")
         print(f"Raw content (last 500 chars):\n{raw_content[-500:]}")
         return {"content": raw_content}
-
