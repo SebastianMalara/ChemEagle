@@ -207,7 +207,7 @@ def run_pipeline(
         else:
             return '\n'.join(status_bits + [f'Unsupported file type: {suffix}']), '{}'
     except Exception as e:
-        if chemeagle_device in {'auto', 'cuda'} and 'cuda out of memory' in str(e).lower() and suffix != '.pdf':
+        if chemeagle_device in {'auto', 'cuda'} and any(msg in str(e).lower() for msg in ['cuda out of memory', 'out of memory']) and suffix != '.pdf':
             status_bits.append('CUDA OOM detected; retrying once on CPU.')
             try:
                 _release_gpu_memory()
@@ -240,7 +240,7 @@ def build_app() -> gr.Blocks:
             env_path = gr.Textbox(label='Env file path', value=str(ENV_FILE_DEFAULT), scale=2)
             save_env = gr.Checkbox(label='Save form values to env file', value=True)
             mode = gr.Radio(['cloud', 'local_os'], value='cloud', label='Run mode')
-            chemeagle_device = gr.Radio(['auto', 'cpu', 'cuda'], value=vals.get('CHEMEAGLE_DEVICE', 'auto'), label='Compute device')
+            chemeagle_device = gr.Radio(['auto', 'cpu', 'cuda', 'metal'], value=vals.get('CHEMEAGLE_DEVICE', 'auto'), label='Compute device')
 
         with gr.Accordion('Environment settings', open=True):
             with gr.Row():

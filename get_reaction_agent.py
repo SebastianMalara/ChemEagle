@@ -55,13 +55,22 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
 
 def _resolve_device() -> torch.device:
     pref = os.getenv("CHEMEAGLE_DEVICE", "auto").strip().lower()
+    mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
     if pref == "cuda":
         if torch.cuda.is_available():
             return torch.device('cuda')
         print("CHEMEAGLE_DEVICE=cuda requested but CUDA is unavailable. Falling back to CPU.")
         return torch.device('cpu')
-    if pref == "auto" and torch.cuda.is_available():
-        return torch.device('cuda')
+    if pref in {"metal", "mps"}:
+        if mps_available:
+            return torch.device('mps')
+        print("CHEMEAGLE_DEVICE=metal requested but MPS is unavailable. Falling back to CPU.")
+        return torch.device('cpu')
+    if pref == "auto":
+        if torch.cuda.is_available():
+            return torch.device('cuda')
+        if mps_available:
+            return torch.device('mps')
     return torch.device('cpu')
 
 
