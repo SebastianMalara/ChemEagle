@@ -26,12 +26,22 @@ import os
 import io
 import re
 import time
+from asset_registry import ensure_asset_available
 from llm_wrapper import LLMWrapper
 from runtime_device import resolve_torch_device
 
 _RUNTIME_DEVICE_TYPE: Optional[str] = None
 _RUNTIME_TOOLKIT: Optional[ChemIEToolkit] = None
 _RUNTIME_RXNIM: Optional[RxnIM] = None
+
+
+def _debug_enabled() -> bool:
+    return os.getenv("CHEMEAGLE_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_print(message: str) -> None:
+    if _debug_enabled():
+        print(message)
 
 
 def _get_runtime_models() -> tuple[ChemIEToolkit, RxnIM]:
@@ -44,9 +54,9 @@ def _get_runtime_models() -> tuple[ChemIEToolkit, RxnIM]:
         or _RUNTIME_DEVICE_TYPE != device.type
     ):
         _RUNTIME_TOOLKIT = ChemIEToolkit(device=device)
-        _RUNTIME_RXNIM = RxnIM("./rxn.ckpt", device=device)
+        _RUNTIME_RXNIM = RxnIM(str(ensure_asset_available("rxn_ckpt")), device=device)
         _RUNTIME_DEVICE_TYPE = device.type
-        print(f"[ChemEagle] R-group agent runtime using {device.type.upper()}.")
+        _debug_print(f"[ChemEagle] R-group agent runtime using {device.type.upper()}.")
     return _RUNTIME_TOOLKIT, _RUNTIME_RXNIM
 
 
@@ -755,7 +765,7 @@ def get_full_reaction(image_path: str) -> dict:
                     entry.pop(key, None)
 
     #raw_prediction =json.dumps(raw_prediction)
-    print(f"raw_prediction:{raw_prediction}")
+    _debug_print(f"raw_prediction:{raw_prediction}")
 
     # coref_results = model.extract_molecule_corefs_from_figures([image])
     # for item in coref_results:
@@ -772,7 +782,7 @@ def get_full_reaction(image_path: str) -> dict:
         "reaction_prediction": raw_prediction,  # 是个list
         "molecule_coref": parsed               # 结构化分子识别结果
     }
-    print(f"combined_result:{combined_result}")
+    _debug_print(f"combined_result:{combined_result}")
     return combined_result
 
 def get_full_reaction_OS(image_path: str) -> dict:
@@ -801,7 +811,7 @@ def get_full_reaction_OS(image_path: str) -> dict:
                     entry.pop(key, None)
 
     #raw_prediction =json.dumps(raw_prediction)
-    print(f"raw_prediction:{raw_prediction}")
+    _debug_print(f"raw_prediction:{raw_prediction}")
 
     # coref_results = model.extract_molecule_corefs_from_figures([image])
     # for item in coref_results:
@@ -818,7 +828,7 @@ def get_full_reaction_OS(image_path: str) -> dict:
         "reaction_prediction": raw_prediction,  # 是个list
         "molecule_coref": parsed               # 结构化分子识别结果
     }
-    print(f"combined_result:{combined_result}")
+    _debug_print(f"combined_result:{combined_result}")
     return combined_result
 
 
@@ -851,7 +861,7 @@ def get_full_reaction_template(image_path: str) -> dict:
                     entry.pop(key, None)
 
     #raw_prediction =json.dumps(raw_prediction)
-    print(f"raw_prediction:{raw_prediction}")
+    _debug_print(f"raw_prediction:{raw_prediction}")
     #coref_results = model.extract_molecule_corefs_from_figures([image])
     coref_results = process_reaction_image_with_multiple_products_and_text_correctmultiR(image_path)
     for item in coref_results:
@@ -866,7 +876,7 @@ def get_full_reaction_template(image_path: str) -> dict:
         #"reaction_prediction": raw_prediction,  # 是个list
         "molecule_coref": parsed               # 结构化分子识别结果
     }
-    print(f"combined_result:{combined_result}")
+    _debug_print(f"combined_result:{combined_result}")
     return combined_result
 
 def get_full_reaction_template_OS(image_path: str) -> dict:
@@ -894,7 +904,7 @@ def get_full_reaction_template_OS(image_path: str) -> dict:
                     entry.pop(key, None)
 
     #raw_prediction =json.dumps(raw_prediction)
-    print(f"raw_prediction:{raw_prediction}")
+    _debug_print(f"raw_prediction:{raw_prediction}")
     #coref_results = model.extract_molecule_corefs_from_figures([image])
     coref_results = process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(image_path)
     for item in coref_results:
@@ -909,7 +919,7 @@ def get_full_reaction_template_OS(image_path: str) -> dict:
         #"reaction_prediction": raw_prediction,  # 是个list
         "molecule_coref": parsed               # 结构化分子识别结果
     }
-    print(f"combined_result:{combined_result}")
+    _debug_print(f"combined_result:{combined_result}")
     return combined_result
 
 

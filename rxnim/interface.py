@@ -14,8 +14,8 @@ from .dataset import make_transforms
 from .data import postprocess_reactions, postprocess_bboxes, postprocess_coref_results, ReactionImageData, ImageData, CorefImageData
 
 from molnextr import MolNexTR
-from huggingface_hub import hf_hub_download
 import easyocr
+from asset_registry import ensure_asset_available
 
 
 class RxnIM:
@@ -76,7 +76,7 @@ class RxnIM:
         return model
 
     def get_molnextr(self):
-        ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
+        ckpt_path = str(ensure_asset_available("molnextr_ckpt"))
         molnextr = MolNexTR(ckpt_path, device=self.device)
         return molnextr
 
@@ -222,7 +222,7 @@ class MolDetect:
         return model
 
     def get_molnextr(self): 
-        ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
+        ckpt_path = str(ensure_asset_available("molnextr_ckpt"))
         molnextr = MolNexTR(ckpt_path, device=self.device)
         return molnextr
 
@@ -285,4 +285,3 @@ class MolDetect:
         plt.close(fig)
         return results
             
-

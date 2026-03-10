@@ -27,6 +27,14 @@ import time
 from llm_wrapper import LLMWrapper
 from runtime_device import resolve_torch_device
 
+def _debug_enabled() -> bool:
+    return os.getenv("CHEMEAGLE_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_print(message: str) -> None:
+    if _debug_enabled():
+        print(message)
+
 
 def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
     last_exception = None
@@ -72,7 +80,7 @@ def _get_toolkit() -> ChemIEToolkit:
     if _RUNTIME_TOOLKIT is None or _RUNTIME_DEVICE_TYPE != device.type:
         _RUNTIME_TOOLKIT = ChemIEToolkit(device=device)
         _RUNTIME_DEVICE_TYPE = device.type
-        print(f"[ChemEagle] Molecular agent runtime using {device.type.upper()}.")
+        _debug_print(f"[ChemEagle] Molecular agent runtime using {device.type.upper()}.")
     return _RUNTIME_TOOLKIT
 
 
@@ -587,7 +595,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
     
     # 获取 GPT 生成的结果
     gpt_output = [json.loads(response.choices[0].message.content)]
-    print(f"gpt_output_mol:{gpt_output}")
+    _debug_print(f"gpt_output_mol:{gpt_output}")
 
 
     def get_multi_molecular(image_path: str) -> list:
@@ -674,7 +682,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
         return input_data
 
     updated_data = update_smiles_and_molfile(input2_updated, _convert_graph_to_smiles)
-    print(f"mol_agent_output:{updated_data}")
+    _debug_print(f"mol_agent_output:{updated_data}")
 
     return updated_data
 
@@ -830,7 +838,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
     
     # 获取 GPT 生成的结果
     gpt_output = [json.loads(response.choices[0].message.content)]
-    print(f"gpt_output_mol:{gpt_output}")
+    _debug_print(f"gpt_output_mol:{gpt_output}")
 
 
     def get_multi_molecular(image_path: str) -> list:
@@ -947,7 +955,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
         return input_data
 
     updated_data = update_smiles_and_molfile(input2_updated, _convert_graph_to_smiles)
-    print(f"mol_agent_output:{updated_data}")
+    _debug_print(f"mol_agent_output:{updated_data}")
 
     return updated_data
 
@@ -1133,7 +1141,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
                 raw_content, 0
             )
     
-    print(f"gpt_output_mol:{gpt_output}")
+    _debug_print(f"gpt_output_mol:{gpt_output}")
 
     def get_multi_molecular(image_path: str) -> list:
         '''Returns a list of reactions extracted from the image.'''
@@ -1245,6 +1253,6 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
         return input_data
 
     updated_data = update_smiles_and_molfile(input2_updated, _convert_graph_to_smiles)
-    print(f"mol_agent_output:{updated_data}")
+    _debug_print(f"mol_agent_output:{updated_data}")
 
     return updated_data

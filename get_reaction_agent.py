@@ -19,6 +19,7 @@ from PIL import Image
 import os
 from typing import Optional
 import time
+from asset_registry import ensure_asset_available
 from llm_wrapper import LLMWrapper
 from runtime_device import resolve_torch_device
 
@@ -63,7 +64,7 @@ def _get_rxnim() -> RxnIM:
 
     device = resolve_torch_device()
     if _RUNTIME_RXNIM is None or _RUNTIME_DEVICE_TYPE != device.type:
-        _RUNTIME_RXNIM = RxnIM("./rxn.ckpt", device=device)
+        _RUNTIME_RXNIM = RxnIM(str(ensure_asset_available("rxn_ckpt")), device=device)
         _RUNTIME_DEVICE_TYPE = device.type
         print(f"[ChemEagle] Reaction agent runtime using {device.type.upper()}.")
     return _RUNTIME_RXNIM

@@ -48,16 +48,17 @@ In this work, we present ChemEAGLE, a multimodal large language model (MLLM)-bas
 
 
 ## :rocket: Using the code for ChemEAGLE
-### Quick installer (models + API configuration)
+### Quick installer (offline assets + API configuration)
 
-You can run the interactive installer to download required model files, optionally clone helper repos, and generate an LLM environment file:
+You can run the interactive installer to prepare the offline asset bundle, optionally clone helper repos, and generate an LLM environment file:
 
 ```bash
 python installer.py
 ```
 
 What it does:
-- Downloads required model weights from `CYF200127/ChemEAGLEModel` into `./models` (and mirrors key files in project root for default paths).
+- Installs the canonical offline asset bundle into `./assets` by default.
+- Reuses legacy repo-root files and Hugging Face cache entries by copying them into `./assets` when possible.
 - Optionally clones helper repositories (for example, ChemRxnExtractor) into `./external`.
 - Guides you through selecting an LLM provider and writes `.env.chemeagle` plus `load_chemeagle_env.sh`.
 
@@ -70,8 +71,9 @@ source ./load_chemeagle_env.sh
 Useful options:
 
 ```bash
-python installer.py --provider openai
-python installer.py --model-dir ./models --repos-dir ./external
+python installer.py install-all --provider openai
+python installer.py verify
+python installer.py repair --skip-provider-setup --no-clone
 python installer.py --dry-run
 ```
 
@@ -396,7 +398,7 @@ Verify torch install:
 python -c "import torch; print('torch', torch.__version__); print('cuda_available', torch.cuda.is_available())"
 ```
 
-### 5) Run ChemEAGLE installer (models + env helpers)
+### 5) Run ChemEAGLE installer (offline assets + env helpers)
 
 Interactive installer:
 
@@ -407,15 +409,17 @@ python installer.py
 Non-interactive examples:
 
 ```bash
-python installer.py --provider openai
-python installer.py --provider azure
-python installer.py --provider anthropic
-python installer.py --model-dir ./models --repos-dir ./external
+python installer.py install-all --provider openai
+python installer.py install-all --provider azure
+python installer.py install-all --provider anthropic
+python installer.py verify
+python installer.py repair --skip-provider-setup --no-clone
 ```
 
-The installer downloads model files and writes:
+The installer prepares the offline asset bundle under `./assets` (or `$CHEMEAGLE_ASSET_ROOT`) and writes:
 - `.env.chemeagle`
 - `load_chemeagle_env.sh`
+- `assets/asset-manifest.json`
 
 Load environment variables:
 
@@ -430,6 +434,7 @@ python scripts/preflight_check.py
 ```
 
 Preflight verifies platform basics, GPU visibility, and required model/prompt files.
+It also reports which assets are blocking, optional, or unused for the current mode/backend/tool selection.
 
 ### 7) Start ChemEAGLE
 
@@ -502,7 +507,7 @@ PY
 ### 9) Go-live troubleshooting checklist
 
 - If `nvidia-smi` fails: reinstall/fix NVIDIA driver.
-- If `python scripts/preflight_check.py` reports missing models: run `python installer.py`.
+- If `python scripts/preflight_check.py` reports missing assets: run `python installer.py repair` to copy/download only what is missing into `./assets`, or `python installer.py install-all` for a full bundle refresh.
 - If `pip install -r requirements.txt` fails with `No matching distribution found for torch==2.2.0`, you are likely on Python 3.12/3.13. Recreate the env with Python 3.10 and reinstall.
 - If OpenCV import fails: verify `libgl1` and `libglib2.0-0` are installed.
 - If PDF conversion fails: verify `poppler-utils` is installed and in `PATH`.
