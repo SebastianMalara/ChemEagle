@@ -18,7 +18,7 @@ import torch
 import json
 from PIL import Image
 import numpy as np
-from openai import AzureOpenAI,  OpenAI
+from openai import OpenAI
 from typing import Optional
 import copy
 from molnextr.chemistry import _convert_graph_to_smiles 
@@ -26,7 +26,7 @@ import os
 import io
 import re
 import time
-from openai import InternalServerError, RateLimitError, APIError
+from llm_wrapper import LLMWrapper
 from runtime_device import resolve_torch_device
 
 _RUNTIME_DEVICE_TYPE: Optional[str] = None
@@ -75,47 +75,18 @@ def _normalize_chat_message(message) -> dict:
 
 
 
-def _get_azure_client() -> AzureOpenAI | OpenAI:
-    provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
+def _get_azure_client():
+    return LLMWrapper.from_env(default_model=os.getenv("LLM_MODEL") or "gpt-5-mini").as_chat_completion_client()
 
-    if provider == "azure":
-        api_key = os.getenv("API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
-        azure_endpoint = os.getenv("AZURE_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_version = os.getenv("API_VERSION", "2024-06-01")
 
-        if not api_key or not azure_endpoint:
-            raise ValueError(
-                "Azure provider requires API_KEY (or AZURE_OPENAI_API_KEY) and "
-                "AZURE_ENDPOINT (or AZURE_OPENAI_ENDPOINT)."
-            )
-
-        return AzureOpenAI(
-            api_key=api_key,
-            api_version=api_version,
-            azure_endpoint=azure_endpoint,
-        )
-
-    if provider in {"openai", "openai_compatible", "lmstudio", "local_openai"}:
-        api_key = (
-            os.getenv("OPENAI_API_KEY")
-            or os.getenv("LLM_API_KEY")
-            or os.getenv("VLLM_API_KEY")
-            or os.getenv("API_KEY")
-            or "EMPTY"
-        )
-        base_url = (
-            os.getenv("LLM_BASE_URL")
-            or os.getenv("OPENAI_BASE_URL")
-            or os.getenv("VLLM_BASE_URL")
-            or os.getenv("LMSTUDIO_BASE_URL")
-        )
-
-        kwargs = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        return OpenAI(**kwargs)
-
-    raise ValueError(f"Unsupported LLM_PROVIDER for cloud mode: {provider}")
+def _extract_valid_coref_entries(bboxes, group):
+    if not isinstance(group, (list, tuple)):
+        return []
+    valid_entries = []
+    for raw_idx in group:
+        if isinstance(raw_idx, int) and 0 <= raw_idx < len(bboxes):
+            valid_entries.append((raw_idx, bboxes[raw_idx]))
+    return valid_entries
 
 def normalize_product_variant_output(data: dict) -> dict:
    
@@ -224,13 +195,13 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
     for attempt in range(max_retries):
         try:
             return func(*args, **kwargs)
-        except (InternalServerError, RateLimitError, APIError) as e:
+        except Exception as e:
             last_exception = e
             error_code = getattr(e, 'status_code', None) or getattr(e, 'code', None)
             error_message = str(e)
             
-            # 检查是否是 503 错误或其他可重试的错误
-            if error_code == 503 or 'overloaded' in error_message.lower() or '503' in error_message:
+            # Retry transient provider errors across OpenAI-compatible and Anthropic clients.
+            if error_code in {429, 500, 502, 503, 529} or 'overloaded' in error_message.lower() or '503' in error_message or 'rate limit' in error_message.lower():
                 if attempt < max_retries - 1:
                     delay = base_delay * (backoff_factor ** attempt)
                     print(f"⚠️ API 调用失败 (503/过载)，第 {attempt + 1}/{max_retries} 次尝试。{delay:.1f} 秒后重试...")
@@ -242,8 +213,7 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
             else:
                 # 其他类型的错误，直接抛出
                 raise
-        except Exception as e:
-            # 其他未知错误，直接抛出
+        except BaseException:
             raise
     
     # 如果所有重试都失败了
@@ -454,18 +424,23 @@ def extract_json_from_text_with_reasoning(text):
 
 
 def parse_coref_data_with_fallback(data):
-    bboxes = data["bboxes"]
-    corefs = data["corefs"]
+    bboxes = data.get("bboxes", [])
+    corefs = data.get("corefs", [])
     paired_indices = set()
 
     # 先处理有 coref 配对的
     results = []
-    for idx1, idx2 in corefs:
-        smiles_entry = bboxes[idx1] if "smiles" in bboxes[idx1] else bboxes[idx2]
-        text_entry = bboxes[idx2] if "text" in bboxes[idx2] else bboxes[idx1]
+    for group in corefs:
+        valid_entries = _extract_valid_coref_entries(bboxes, group)
+        if not valid_entries:
+            continue
+
+        smiles_entry = next((entry for _, entry in valid_entries if "smiles" in entry), None)
+        text_entry = next((entry for _, entry in valid_entries if "text" in entry), None)
+        if smiles_entry is None:
+            continue
 
         smiles = smiles_entry.get("smiles", "")
-        #bbox= smiles_entry.get("bbox", ())
         bbox_id = smiles_entry.get("bbox_id", "")
         
         # 如果 smiles_entry 有 sub_text，直接使用 sub_text；否则使用 text_entry 的 text
@@ -473,23 +448,19 @@ def parse_coref_data_with_fallback(data):
             result_item = {
                 "smiles": smiles,
                 "text": smiles_entry["sub_text"],
-                #"bbox": bbox,
                 "bbox_id": bbox_id
             }
         else:
-            texts = text_entry.get("text", [])
+            texts = text_entry.get("text", []) if text_entry else []
             result_item = {
                 "smiles": smiles,
-                "texts": texts,
-                #"bbox": bbox,
+                "texts": texts or ["There is no label or failed to detect, please recheck the image again"],
                 "bbox_id": bbox_id
             }
         
         results.append(result_item)
 
-        # 记录下哪些 SMILES 被配对过了
-        paired_indices.add(idx1)
-        paired_indices.add(idx2)
+        paired_indices.update(idx for idx, _ in valid_entries)
 
     # 处理未配对的 SMILES（补充进来）
     for idx, entry in enumerate(bboxes):
@@ -499,44 +470,46 @@ def parse_coref_data_with_fallback(data):
                 result_item = {
                     "smiles": entry["smiles"],
                     "text": entry["sub_text"],
-                    #"bbox": entry["bbox"],
-                    "bbox_id": entry["bbox_id"],
+                    "bbox_id": entry.get("bbox_id", ""),
                 }
             else:
                 result_item = {
                     "smiles": entry["smiles"],
                     "texts": ["There is no label or failed to detect, please recheck the image again"],
-                    #"bbox": entry["bbox"],
-                    "bbox_id": entry["bbox_id"],
+                    "bbox_id": entry.get("bbox_id", ""),
                 }
             results.append(result_item)
 
     return results
 
 def parse_coref_data_with_fallback_with_box(data):
-    bboxes = data["bboxes"]
-    corefs = data["corefs"]
+    bboxes = data.get("bboxes", [])
+    corefs = data.get("corefs", [])
     paired_indices = set()
 
     # 先处理有 coref 配对的
     results = []
-    for idx1, idx2 in corefs:
-        smiles_entry = bboxes[idx1] if "smiles" in bboxes[idx1] else bboxes[idx2]
-        text_entry = bboxes[idx2] if "text" in bboxes[idx2] else bboxes[idx1]
+    for group in corefs:
+        valid_entries = _extract_valid_coref_entries(bboxes, group)
+        if not valid_entries:
+            continue
+
+        smiles_entry = next((entry for _, entry in valid_entries if "smiles" in entry), None)
+        text_entry = next((entry for _, entry in valid_entries if "text" in entry), None)
+        if smiles_entry is None:
+            continue
 
         smiles = smiles_entry.get("smiles", "")
-        bboxes = smiles_entry.get("bbox", [])
-        texts = text_entry.get("text", [])
+        bbox_coords = smiles_entry.get("bbox", [])
+        texts = text_entry.get("text", []) if text_entry else []
 
         results.append({
             "smiles": smiles,
-            "texts": texts,
-            "bbox": bboxes
+            "texts": texts or ["There is no label or failed to detect, please recheck the image again"],
+            "bbox": bbox_coords
         })
 
-        # 记录下哪些 SMILES 被配对过了
-        paired_indices.add(idx1)
-        paired_indices.add(idx2)
+        paired_indices.update(idx for idx, _ in valid_entries)
 
     # 处理未配对的 SMILES（补充进来）
     for idx, entry in enumerate(bboxes):

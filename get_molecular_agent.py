@@ -19,11 +19,12 @@ import json
 from PIL import Image
 import numpy as np
 from chemietoolkit import ChemIEToolkit, utils
-from openai import AzureOpenAI, OpenAI, InternalServerError, RateLimitError, APIError
+from openai import OpenAI
 import os
 import copy
 from typing import Optional
 import time
+from llm_wrapper import LLMWrapper
 from runtime_device import resolve_torch_device
 
 
@@ -33,13 +34,13 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
     for attempt in range(max_retries):
         try:
             return func(*args, **kwargs)
-        except (InternalServerError, RateLimitError, APIError) as e:
+        except Exception as e:
             last_exception = e
             error_code = getattr(e, 'status_code', None) or getattr(e, 'code', None)
             error_message = str(e)
             
-            # 检查是否是 503 错误或其他可重试的错误
-            if error_code == 503 or 'overloaded' in error_message.lower() or '503' in error_message:
+            # Retry transient provider errors across OpenAI-compatible and Anthropic clients.
+            if error_code in {429, 500, 502, 503, 529} or 'overloaded' in error_message.lower() or '503' in error_message or 'rate limit' in error_message.lower():
                 if attempt < max_retries - 1:
                     delay = base_delay * (backoff_factor ** attempt)
                     print(f"⚠️ API 调用失败 (503/过载)，第 {attempt + 1}/{max_retries} 次尝试。{delay:.1f} 秒后重试...")
@@ -51,8 +52,7 @@ def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, *
             else:
                 # 其他类型的错误，直接抛出
                 raise
-        except Exception as e:
-            # 其他未知错误，直接抛出
+        except BaseException:
             raise
     
     # 如果所有重试都失败了
@@ -75,47 +75,41 @@ def _get_toolkit() -> ChemIEToolkit:
         print(f"[ChemEagle] Molecular agent runtime using {device.type.upper()}.")
     return _RUNTIME_TOOLKIT
 
-def _get_azure_client() -> AzureOpenAI | OpenAI:
-    provider = (os.getenv("LLM_PROVIDER") or "azure").strip().lower()
 
-    if provider == "azure":
-        api_key = os.getenv("API_KEY") or os.getenv("AZURE_OPENAI_API_KEY")
-        azure_endpoint = os.getenv("AZURE_ENDPOINT") or os.getenv("AZURE_OPENAI_ENDPOINT")
-        api_version = os.getenv("API_VERSION", "2024-06-01")
+def _normalize_bbox_key(bbox, digits=3):
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        return tuple(round(float(value), digits) for value in bbox)
+    except (TypeError, ValueError):
+        return None
 
-        if not api_key or not azure_endpoint:
-            raise ValueError(
-                "Azure provider requires API_KEY (or AZURE_OPENAI_API_KEY) and "
-                "AZURE_ENDPOINT (or AZURE_OPENAI_ENDPOINT)."
-            )
 
-        return AzureOpenAI(
-            api_key=api_key,
-            api_version=api_version,
-            azure_endpoint=azure_endpoint,
-        )
+def _find_matching_bbox_index(orig_bboxes, bbox, exact_lookup=None, tolerance=0.02):
+    bbox_key = _normalize_bbox_key(bbox)
+    if bbox_key is None:
+        return None
+    if exact_lookup and bbox_key in exact_lookup:
+        return exact_lookup[bbox_key]
 
-    if provider in {"openai", "openai_compatible", "lmstudio", "local_openai"}:
-        api_key = (
-            os.getenv("OPENAI_API_KEY")
-            or os.getenv("LLM_API_KEY")
-            or os.getenv("VLLM_API_KEY")
-            or os.getenv("API_KEY")
-            or "EMPTY"
-        )
-        base_url = (
-            os.getenv("LLM_BASE_URL")
-            or os.getenv("OPENAI_BASE_URL")
-            or os.getenv("VLLM_BASE_URL")
-            or os.getenv("LMSTUDIO_BASE_URL")
-        )
+    best_idx = None
+    best_distance = None
+    for idx, candidate in enumerate(orig_bboxes):
+        candidate_key = _normalize_bbox_key(candidate.get("bbox"))
+        if candidate_key is None:
+            continue
+        distance = max(abs(lhs - rhs) for lhs, rhs in zip(candidate_key, bbox_key))
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_idx = idx
 
-        kwargs = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        return OpenAI(**kwargs)
+    if best_idx is not None and best_distance is not None and best_distance <= tolerance:
+        return best_idx
+    return None
 
-    raise ValueError(f"Unsupported LLM_PROVIDER for cloud mode: {provider}")
+
+def _get_azure_client():
+    return LLMWrapper.from_env(default_model=os.getenv("LLM_MODEL") or "gpt-5-mini").as_chat_completion_client()
 
 
 def _normalize_chat_message(message):
@@ -858,14 +852,19 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
             orig_bboxes = item2.get('bboxes', [])
             orig_corefs = item2.get('corefs', [])
             # 1. 构造新的bboxes（严格用同bbox作为模板）
-            coord2idx = {tuple(bb['bbox']): i for i, bb in enumerate(orig_bboxes)}
+            coord2idx = {}
+            for i, bb in enumerate(orig_bboxes):
+                bbox_key = _normalize_bbox_key(bb.get('bbox'))
+                if bbox_key is not None and bbox_key not in coord2idx:
+                    coord2idx[bbox_key] = i
             new_bboxes = []
             for bb1 in item1.get('bboxes', []):
-                coord = tuple(bb1['bbox'])
-                if coord in coord2idx:
-                    bb_template = orig_bboxes[coord2idx[coord]]
-                else:
-                    raise ValueError(f"扩展mol时未找到bbox {coord} 的原始模板！")
+                coord = bb1.get('bbox')
+                match_idx = _find_matching_bbox_index(orig_bboxes, coord, coord2idx)
+                if match_idx is None:
+                    print(f"warning: skipping unmatched bbox template {coord}")
+                    continue
+                bb_template = orig_bboxes[match_idx]
                 bb_new = copy.deepcopy(bb_template)
                 if 'symbols' in bb1:
                     bb_new['symbols'] = bb1['symbols']
@@ -883,23 +882,34 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
             # 步骤：找出原组里mol的所有新索引，以及label的新索引，按原corefs分组生成新组
             coord2new_idxs = {}
             for idx, bb in enumerate(new_bboxes):
-                coord = tuple(bb['bbox'])
-                coord2new_idxs.setdefault(coord, []).append(idx)
+                coord = _normalize_bbox_key(bb.get('bbox'))
+                if coord is not None:
+                    coord2new_idxs.setdefault(coord, []).append(idx)
             new_corefs = []
             for group in orig_corefs:
-                # 假设group = [mol_idx, idt_idx] 或 [mol_idx1, mol_idx2, ..., idt_idx]
-                label_idx = group[-1]
-                label_coord = tuple(orig_bboxes[label_idx]['bbox'])
-                new_label_idx = coord2new_idxs[label_coord][-1]  # label只会有一个
-                # 所有mol的扩展后新索引
-                for mol_idx in group[:-1]:
-                    mol_coord = tuple(orig_bboxes[mol_idx]['bbox'])
-                    for new_mol_idx in coord2new_idxs[mol_coord]:
+                if not isinstance(group, (list, tuple)) or len(group) < 2:
+                    continue
+                valid_group = [idx for idx in group if isinstance(idx, int) and 0 <= idx < len(orig_bboxes)]
+                if len(valid_group) < 2:
+                    continue
+                label_idx = valid_group[-1]
+                label_coord = _normalize_bbox_key(orig_bboxes[label_idx].get('bbox'))
+                if label_coord is None or label_coord not in coord2new_idxs:
+                    continue
+                new_label_idx = coord2new_idxs[label_coord][-1]
+                for mol_idx in valid_group[:-1]:
+                    mol_coord = _normalize_bbox_key(orig_bboxes[mol_idx].get('bbox'))
+                    if mol_coord is None:
+                        continue
+                    for new_mol_idx in coord2new_idxs.get(mol_coord, []):
                         new_corefs.append([new_mol_idx, new_label_idx])
             # 3. 装配结构
             new_item = copy.deepcopy(item2)
-            new_item['bboxes'] = new_bboxes
-            new_item['corefs'] = new_corefs
+            if new_bboxes:
+                new_item['bboxes'] = new_bboxes
+                new_item['corefs'] = new_corefs
+            else:
+                print("warning: no matched bbox templates found; keeping original molecular corefs")
             results.append(new_item)
         return results
 
@@ -1142,14 +1152,19 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
             orig_bboxes = item2.get('bboxes', [])
             orig_corefs = item2.get('corefs', [])
             # 1. 构造新的bboxes（严格用同bbox作为模板）
-            coord2idx = {tuple(bb['bbox']): i for i, bb in enumerate(orig_bboxes)}
+            coord2idx = {}
+            for i, bb in enumerate(orig_bboxes):
+                bbox_key = _normalize_bbox_key(bb.get('bbox'))
+                if bbox_key is not None and bbox_key not in coord2idx:
+                    coord2idx[bbox_key] = i
             new_bboxes = []
             for bb1 in item1.get('bboxes', []):
-                coord = tuple(bb1['bbox'])
-                if coord in coord2idx:
-                    bb_template = orig_bboxes[coord2idx[coord]]
-                else:
-                    raise ValueError(f"扩展mol时未找到bbox {coord} 的原始模板！")
+                coord = bb1.get('bbox')
+                match_idx = _find_matching_bbox_index(orig_bboxes, coord, coord2idx)
+                if match_idx is None:
+                    print(f"warning: skipping unmatched bbox template {coord}")
+                    continue
+                bb_template = orig_bboxes[match_idx]
                 bb_new = copy.deepcopy(bb_template)
                 if 'symbols' in bb1:
                     bb_new['symbols'] = bb1['symbols']
@@ -1167,23 +1182,34 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
             # 步骤：找出原组里mol的所有新索引，以及label的新索引，按原corefs分组生成新组
             coord2new_idxs = {}
             for idx, bb in enumerate(new_bboxes):
-                coord = tuple(bb['bbox'])
-                coord2new_idxs.setdefault(coord, []).append(idx)
+                coord = _normalize_bbox_key(bb.get('bbox'))
+                if coord is not None:
+                    coord2new_idxs.setdefault(coord, []).append(idx)
             new_corefs = []
             for group in orig_corefs:
-                # 假设group = [mol_idx, idt_idx] 或 [mol_idx1, mol_idx2, ..., idt_idx]
-                label_idx = group[-1]
-                label_coord = tuple(orig_bboxes[label_idx]['bbox'])
-                new_label_idx = coord2new_idxs[label_coord][-1]  # label只会有一个
-                # 所有mol的扩展后新索引
-                for mol_idx in group[:-1]:
-                    mol_coord = tuple(orig_bboxes[mol_idx]['bbox'])
-                    for new_mol_idx in coord2new_idxs[mol_coord]:
+                if not isinstance(group, (list, tuple)) or len(group) < 2:
+                    continue
+                valid_group = [idx for idx in group if isinstance(idx, int) and 0 <= idx < len(orig_bboxes)]
+                if len(valid_group) < 2:
+                    continue
+                label_idx = valid_group[-1]
+                label_coord = _normalize_bbox_key(orig_bboxes[label_idx].get('bbox'))
+                if label_coord is None or label_coord not in coord2new_idxs:
+                    continue
+                new_label_idx = coord2new_idxs[label_coord][-1]
+                for mol_idx in valid_group[:-1]:
+                    mol_coord = _normalize_bbox_key(orig_bboxes[mol_idx].get('bbox'))
+                    if mol_coord is None:
+                        continue
+                    for new_mol_idx in coord2new_idxs.get(mol_coord, []):
                         new_corefs.append([new_mol_idx, new_label_idx])
             # 3. 装配结构
             new_item = copy.deepcopy(item2)
-            new_item['bboxes'] = new_bboxes
-            new_item['corefs'] = new_corefs
+            if new_bboxes:
+                new_item['bboxes'] = new_bboxes
+                new_item['corefs'] = new_corefs
+            else:
+                print("warning: no matched bbox templates found; keeping original molecular corefs")
             results.append(new_item)
         return results
 
