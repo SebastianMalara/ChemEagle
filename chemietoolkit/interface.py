@@ -1,13 +1,14 @@
 import torch
 import re
 from functools import lru_cache
+from pathlib import Path
 import layoutparser as lp
 import pdf2image
 from PIL import Image
-from huggingface_hub import hf_hub_download, snapshot_download
 from molnextr import MolNexTR
 from rxnim import RxnIM, MolDetect
 from chemiener import ChemNER
+from asset_registry import ensure_asset_available
 from .chemrxnextractor import ChemRxnExtractor
 from .tableextractor import TableExtractor
 from .utils import *
@@ -42,7 +43,7 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "molnextr.pth")
+            ckpt_path = str(ensure_asset_available("molnextr_ckpt"))
         self._molnextr = MolNexTR(ckpt_path, device=self.device)
     
 
@@ -60,7 +61,7 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "rxn.ckpt")
+            ckpt_path = str(ensure_asset_available("rxn_ckpt"))
         self._rxnim = RxnIM(ckpt_path, device=self.device)
     
 
@@ -95,7 +96,7 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "moldet.ckpt")
+            ckpt_path = str(ensure_asset_available("moldet_ckpt"))
         self._moldet = MolDetect(ckpt_path, device=self.device)
         
 
@@ -113,7 +114,7 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "corefdet.ckpt")
+            ckpt_path = str(ensure_asset_available("corefdet_ckpt"))
         self._coref = MolDetect(ckpt_path, device=self.device, coref=True)
 
 
@@ -131,10 +132,13 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = snapshot_download(repo_id="amberwang/chemrxnextractor-training-modules")
+            ckpt_path = str(ensure_asset_available("chemrxnextractor_models"))
         if self.device.type == "mps":
             warn_once("ChemRxnExtractor does not support MPS directly. Using CPU for text reaction extraction.")
-        self._chemrxnextractor = ChemRxnExtractor("", None, ckpt_path, self.device.type)
+        model_root = Path(ckpt_path)
+        if model_root.name == "cre_models_v0.1":
+            model_root = model_root.parent
+        self._chemrxnextractor = ChemRxnExtractor("", None, str(model_root), self.device.type)
 
 
     @property
@@ -151,7 +155,7 @@ class ChemIEToolkit:
             ckpt_path: path to checkpoint to use, if None then will use default
         """
         if ckpt_path is None:
-            ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "ner.ckpt")
+            ckpt_path = str(ensure_asset_available("ner_ckpt"))
         self._chemner = ChemNER(ckpt_path, device=self.device)
 
     

@@ -1,8 +1,8 @@
 import os
 from pdf2image import convert_from_path
-from transformers import AutoProcessor, AutoModelForCausalLM 
+from transformers import AutoProcessor, AutoModelForCausalLM, logging as transformers_logging
 from safetensors.torch import load_file
-from huggingface_hub import hf_hub_download
+from asset_registry import ensure_asset_available
 
 """
 Extracts all tables and figures from PDF documents, with the associated captions/
@@ -12,9 +12,6 @@ Adapted from TF-ID model https://github.com/ai8hyf/TF-ID
 
 LARGE_MODEL_ID = "shixuanleong/visualheist-large" 
 BASE_MODEL_ID = "shixuanleong/visualheist-base" 
-LARGE_SAFETENSORS_PATH = "https://huggingface.co/shixuanleong/visualheist-large/resolve/main/model.safetensors" 
-BASE_SAFETENSORS_PATH = "https://huggingface.co/shixuanleong/visualheist-base/resolve/main/model.safetensors" 
-
 def _pdf_to_image(pdf_path):
     """Converts a pdf into a list of images
     :param pdf_path: Path to pdf
@@ -87,15 +84,16 @@ def _create_model(model_id, base_or_large):
     :rtype: tuple[AutoModelForCausalLM, AutoProcessor]
     """
     
-    package_dir = os.path.dirname(__file__)
-    safetensors_filename = base_or_large + "_model.safetensors"
-    safetensors_download_path = package_dir + "/../safetensors/" + safetensors_filename
-    if not os.path.exists(safetensors_download_path):
-        safetensors_download_path = hf_hub_download(repo_id=model_id, filename="model.safetensors")
-
+    asset_id = "visualheist_large" if base_or_large == "large" else "visualheist_base"
+    safetensors_download_path = str(ensure_asset_available(asset_id))
     state_dict = load_file(safetensors_download_path)
-    model = AutoModelForCausalLM.from_pretrained(model_id, state_dict=state_dict, trust_remote_code=True)
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    previous_verbosity = transformers_logging.get_verbosity()
+    transformers_logging.set_verbosity_error()
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_id, state_dict=state_dict, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+    finally:
+        transformers_logging.set_verbosity(previous_verbosity)
     return model, processor
 
 

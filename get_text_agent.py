@@ -13,9 +13,9 @@ import pytesseract
 from PIL import Image
 from chemiener import ChemNER
 from chemrxnextractor import RxnExtractor
-from huggingface_hub import hf_hub_download
 from openai import OpenAI
 
+from asset_registry import AssetNotAvailableError, ensure_asset_available
 from llm_wrapper import LLMWrapper
 from runtime_device import (
     easyocr_uses_acceleration,
@@ -24,13 +24,41 @@ from runtime_device import (
     warn_once,
 )
 
-model_dir = "./cre_models_v0.1"
-ckpt_path = "./ner.ckpt"
-
 _CHEMNER_MODELS: dict[str, ChemNER] = {}
 _RXN_EXTRACTORS: dict[str, RxnExtractor] = {}
 _EASYOCR_READERS: dict[tuple[tuple[str, ...], str], Any] = {}
 _OCR_TEXT_CACHE: dict[tuple[str, ...], str] = {}
+
+
+def _text_asset_error_payload(agent_name: str, image_path: str, exc: AssetNotAvailableError) -> dict:
+    status = exc.status
+    return {
+        "tool_status": "unavailable",
+        "tool_name": agent_name,
+        "image_path": image_path,
+        "warning": str(exc),
+        "asset_preflight": {
+            "asset_id": exc.asset_id,
+            "expected_path": str(status.expected_path),
+            "resolved_from": status.resolved_from,
+            "diagnostic": status.diagnostic,
+        },
+        "reactions": [],
+        "entities": [],
+    }
+
+
+def _resolve_rxn_extractor_dir() -> str:
+    return str(ensure_asset_available("chemrxnextractor_models"))
+
+
+def _resolve_chemner_ckpt() -> str:
+    return str(ensure_asset_available("ner_ckpt"))
+
+
+def _ensure_text_assets_ready() -> None:
+    _resolve_rxn_extractor_dir()
+    _resolve_chemner_ckpt()
 
 def _get_azure_client():
     return LLMWrapper.from_env(default_model=os.getenv("LLM_MODEL") or "gpt-5-mini").as_chat_completion_client()
@@ -53,7 +81,7 @@ def _get_rxn_extractor() -> RxnExtractor:
     if cache_key not in _RXN_EXTRACTORS:
         if device.type == "mps":
             warn_once("Text reaction extractor does not support MPS directly. Using CPU for RxnExtractor.")
-        _RXN_EXTRACTORS[cache_key] = RxnExtractor(model_dir, use_cuda=(device.type == "cuda"))
+        _RXN_EXTRACTORS[cache_key] = RxnExtractor(_resolve_rxn_extractor_dir(), use_cuda=(device.type == "cuda"))
     return _RXN_EXTRACTORS[cache_key]
 
 
@@ -63,10 +91,7 @@ def _get_chemner_model() -> ChemNER:
     if cache_key in _CHEMNER_MODELS:
         return _CHEMNER_MODELS[cache_key]
 
-    local_ckpt_path = ckpt_path
-    if not os.path.exists(local_ckpt_path):
-        local_ckpt_path = hf_hub_download("CYF200127/ChemEAGLEModel", "ner.ckpt")
-
+    local_ckpt_path = _resolve_chemner_ckpt()
     _CHEMNER_MODELS[cache_key] = ChemNER(local_ckpt_path, device=device)
     return _CHEMNER_MODELS[cache_key]
 
@@ -425,6 +450,8 @@ def extract_reactions_from_text_in_image(image_path: str) -> dict:
 
     try:
         rxn_extractor = _get_rxn_extractor()
+    except AssetNotAvailableError as e:
+        return _text_asset_error_payload("extract_reactions_from_text_in_image", image_path, e)
     except Exception as e:
         return {"error": f"RxnExtractor unavailable: {e}"}
 
@@ -461,6 +488,8 @@ def NER_from_text_in_image(image_path: str) -> dict:
 
     try:
         model2 = _get_chemner_model()
+    except AssetNotAvailableError as e:
+        return _text_asset_error_payload("NER_from_text_in_image", image_path, e)
     except Exception as e:
         return {"error": f"ChemNER unavailable: {e}"}
 
@@ -484,6 +513,11 @@ def text_extraction_agent(image_path: str) -> dict:
     to perform OCR, reaction extraction, and chemical NER on a single image.
     Returns a merged JSON result.
     """
+    try:
+        _ensure_text_assets_ready()
+    except AssetNotAvailableError as e:
+        return _text_asset_error_payload("text_extraction_agent", image_path, e)
+
     client = _get_text_agent_client()
     model_name = _resolve_text_agent_model()
 
@@ -687,6 +721,11 @@ def text_extraction_agent_OS(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
 ) -> dict:
+    try:
+        _ensure_text_assets_ready()
+    except AssetNotAvailableError as e:
+        return _text_asset_error_payload("text_extraction_agent", image_path, e)
+
     base_url = base_url or os.getenv("VLLM_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://localhost:8000/v1"))
     api_key = api_key or os.getenv("VLLM_API_KEY", os.getenv("OLLAMA_API_KEY", "EMPTY"))
 

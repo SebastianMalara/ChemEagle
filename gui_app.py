@@ -15,6 +15,7 @@ try:
 except ImportError as e:
     raise ImportError("gradio is required for gui_app.py. Install dependencies with: pip install -r requirements.txt") from e
 
+from asset_registry import ASSET_ENV_VAR, build_asset_preflight_report
 from llm_profiles import MANUAL_MODEL_LIST_PROVIDERS, list_available_models, resolve_llm_profile
 from runtime_device import resolve_ocr_backend
 
@@ -27,6 +28,7 @@ PDF_MODEL_CHOICES = ["base", "large"]
 ENV_KEYS = [
     "CHEMEAGLE_RUN_MODE",
     "CHEMEAGLE_DEVICE",
+    "CHEMEAGLE_ASSET_ROOT",
     "LLM_PROVIDER",
     "LLM_MODEL",
     "OCR_BACKEND",
@@ -157,6 +159,7 @@ def build_runtime_values(
 ) -> Dict[str, str]:
     return {
         "CHEMEAGLE_RUN_MODE": mode,
+        "CHEMEAGLE_ASSET_ROOT": os.getenv(ASSET_ENV_VAR, ""),
         "LLM_PROVIDER": llm_provider,
         "LLM_MODEL": llm_model,
         "API_KEY": api_key,
@@ -484,17 +487,15 @@ def _ocr_preflight(mode: str, values: Dict[str, str]) -> Dict[str, Any]:
             "checks": checks,
         }
 
-    probe_lines = [
-        "from chemrxnextractor import RxnExtractor",
-        "from chemiener import ChemNER",
-    ]
+    probe_lines: List[str] = []
     if resolved_backend == "easyocr":
         probe_lines.append("import easyocr")
     elif resolved_backend == "tesseract":
         probe_lines.append("import pytesseract")
-    checks["python_import_probe"] = _probe_python_code("\n".join(probe_lines), env)
-    if not checks["python_import_probe"]["ok"]:
-        blocking_errors.append("OCR/text extraction dependencies failed to import. See diagnostics.ocr_preflight.checks.python_import_probe.")
+    if probe_lines:
+        checks["python_import_probe"] = _probe_python_code("\n".join(probe_lines), env)
+        if not checks["python_import_probe"]["ok"]:
+            blocking_errors.append("OCR backend dependencies failed to import. See diagnostics.ocr_preflight.checks.python_import_probe.")
 
     if resolved_backend == "tesseract":
         tesseract_cmd = _resolve_tesseract_cmd(values)
@@ -619,7 +620,7 @@ def _pdf_preflight(file_path: str, values: Dict[str, str]) -> Dict[str, Any]:
 
     checks["visualheist_cache"] = _visualheist_cache_state(model_size)
     if not checks["visualheist_cache"]["cached"]:
-        warnings.append(f"VisualHeist {model_size} weights are not cached locally. The first PDF run may need to download them.")
+        warnings.append(f"VisualHeist {model_size} weights are not in the legacy locations or Hugging Face cache.")
 
     env = dict(os.environ)
     checks["python_import_probe"] = _probe_python_code(
@@ -636,6 +637,24 @@ def _pdf_preflight(file_path: str, values: Dict[str, str]) -> Dict[str, Any]:
     }
 
 
+def _asset_preflight(
+    file_path: str,
+    mode: str,
+    values: Dict[str, str],
+    *,
+    selected_tools: List[str] | None = None,
+) -> Dict[str, Any]:
+    suffix = Path(file_path).suffix.lower() if file_path else ""
+    file_kind = "pdf" if suffix == ".pdf" else "image"
+    return build_asset_preflight_report(
+        mode=mode,
+        ocr_backend=resolve_ocr_backend(values.get("OCR_BACKEND"), mode),
+        file_kind=file_kind,
+        pdf_model_size=values.get("PDF_MODEL_SIZE") or "large",
+        selected_tools=selected_tools,
+    )
+
+
 def collect_preflight_diagnostics(file_path: str, mode: str, values: Dict[str, str], *, include_pdf_section: bool) -> Dict[str, Any]:
     resolved_ocr_backend = resolve_ocr_backend(values.get("OCR_BACKEND"), mode)
     main_required = mode == "cloud"
@@ -648,6 +667,7 @@ def collect_preflight_diagnostics(file_path: str, mode: str, values: Dict[str, s
         "ocr_llm_preflight": _profile_preflight("ocr", required=ocr_llm_required, values=values),
         "model_catalog_preflight": _model_catalog_preflight(mode, resolved_ocr_backend, values),
         "ocr_preflight": _ocr_preflight(mode, values),
+        "asset_preflight": _asset_preflight(file_path, mode, values),
     }
 
     if include_pdf_section:
@@ -655,7 +675,7 @@ def collect_preflight_diagnostics(file_path: str, mode: str, values: Dict[str, s
 
     blocking_errors: List[str] = []
     warnings: List[str] = []
-    for section_name in ("main_llm_preflight", "ocr_llm_preflight", "model_catalog_preflight", "ocr_preflight", "pdf_preflight"):
+    for section_name in ("main_llm_preflight", "ocr_llm_preflight", "model_catalog_preflight", "ocr_preflight", "asset_preflight", "pdf_preflight"):
         section = diagnostics.get(section_name)
         if not section:
             continue

@@ -14,6 +14,7 @@ import json
 import base64
 import re
 from typing import Optional
+from asset_registry import build_asset_preflight_report
 from get_molecular_agent import process_reaction_image_with_multiple_products_and_text_correctR, process_reaction_image_with_multiple_products_and_text_correctmultiR
 from get_reaction_agent import get_reaction_withatoms_correctR
 from get_R_group_sub_agent import process_reaction_image_with_table_R_group, process_reaction_image_with_product_variant_R_group,get_full_reaction_template_OS,get_full_reaction_template, get_multi_molecular_full, process_reaction_image_with_table_R_group_OS,process_reaction_image_with_product_variant_R_group_OS,get_full_reaction_OS,get_reaction_OS
@@ -83,6 +84,24 @@ def _select_primary_tool(agent_list: list[str]) -> str:
 def _resolve_supported_tool_name(raw_name: Optional[str], tool_map: dict[str, object]) -> str:
     tool_name = _normalize_tool_name(raw_name)
     return tool_name if tool_name in tool_map else ""
+
+
+def _debug_enabled() -> bool:
+    return os.getenv("CHEMEAGLE_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debug_print(message: str) -> None:
+    if _debug_enabled():
+        print(message)
+
+
+def _tool_unavailable_payload(tool_name: str, tool_args: dict, exc: Exception) -> dict:
+    return {
+        "tool_status": "unavailable",
+        "tool_name": tool_name,
+        "arguments": tool_args,
+        "warning": str(exc),
+    }
 
 
 def ChemEagle(
@@ -219,20 +238,20 @@ def ChemEagle(
     )
 
     # 解析 planner 返回的 agent 列表
-    print(f"[D] Planner output: {planner_output}")
+    _debug_print(f"[D] Planner output: {planner_output}")
     
     # 提取 agent 名称（移除可能的括号、花括号等）
     # 移除 { } 和多余的空白
     planner_output = re.sub(r'[{}]', '', planner_output).strip()
     # 分割为 agent 列表
     agent_list = [agent.strip() for agent in planner_output.split(',') if agent.strip()]
-    print(f"[D] Parsed agents: {agent_list}")
+    _debug_print(f"[D] Parsed agents: {agent_list}")
     
     
     selected_tool = _select_primary_tool(agent_list)
     agent_names_lower = [agent.lower() for agent in agent_list]
     
-    print(f"[D] Selected tool: {selected_tool}")
+    _debug_print(f"[D] Selected tool: {selected_tool}")
     
     # Step 3: 工具映射表
     TOOL_MAP = {
@@ -260,7 +279,7 @@ def ChemEagle(
             "name": "text_extraction_agent",
             "arguments": {"image_path": image_path}
         })
-        print(f"[D] Added text_extraction_agent as second tool")
+        _debug_print(f"[D] Added text_extraction_agent as second tool")
     
     # Plan Observer: 审查和修改工具调用计划
     if use_plan_observer:
@@ -292,7 +311,13 @@ def ChemEagle(
     else:
         plan_to_execute = serialized_calls
 
-    print(f"[D] plan_to_execute:{plan_to_execute}")
+    tool_preflight = build_asset_preflight_report(
+        mode="cloud",
+        ocr_backend=os.getenv("OCR_BACKEND", "auto"),
+        file_kind="image",
+        selected_tools=[item.get("name", "") for item in plan_to_execute],
+    )
+    _debug_print(f"[D] plan_to_execute:{plan_to_execute}")
     execution_logs = []
     results = []
 
@@ -307,11 +332,17 @@ def ChemEagle(
         tool_call_id = plan_item.get("id") or f"observer_call_{idx}"
         tool_args = _normalize_tool_args(plan_item.get("arguments", {}), image_path)
 
-        if tool_name in TOOL_MAP:
-            tool_func = TOOL_MAP[tool_name]
-            tool_result = tool_func(**tool_args)
-        else:
+        if tool_name not in TOOL_MAP:
             raise ValueError(f"Unknown tool called: {tool_name}")
+        tool_func = TOOL_MAP[tool_name]
+        try:
+            tool_result = tool_func(**tool_args)
+        except Exception as exc:
+            if tool_name == "text_extraction_agent":
+                tool_result = _tool_unavailable_payload(tool_name, tool_args, exc)
+                tool_result["asset_preflight"] = tool_preflight
+            else:
+                raise
 
         execution_logs.append({
             "id": tool_call_id,
@@ -438,19 +469,19 @@ def ChemEagle_OS(
     
     # 解析 planner 返回的 agent 列表
     planner_output = planner_response.choices[0].message.content.strip()
-    print(f"[OS_D] Planner output: {planner_output}")
+    _debug_print(f"[OS_D] Planner output: {planner_output}")
     
     # 提取 agent 名称（移除可能的括号、花括号等）
     # 移除 { } 和多余的空白
     planner_output = re.sub(r'[{}]', '', planner_output).strip()
     # 分割为 agent 列表
     agent_list = [agent.strip() for agent in planner_output.split(',') if agent.strip()]
-    print(f"[OS_D] Parsed agents: {agent_list}")
+    _debug_print(f"[OS_D] Parsed agents: {agent_list}")
     
     selected_tool = _select_primary_tool(agent_list)
     agent_names_lower = [agent.lower() for agent in agent_list]
     
-    print(f"[OS_D] Selected tool: {selected_tool}")
+    _debug_print(f"[OS_D] Selected tool: {selected_tool}")
     
     TOOL_MAP = {
         'process_reaction_image_with_product_variant_R_group': process_reaction_image_with_product_variant_R_group_OS,
@@ -477,7 +508,7 @@ def ChemEagle_OS(
             "name": "text_extraction_agent",
             "arguments": {"image_path": image_path}
         })
-        print(f"[OS_D] Added text_extraction_agent as second tool")
+        _debug_print(f"[OS_D] Added text_extraction_agent as second tool")
     
     # Plan Observer: 审查和修改工具调用计划
     if use_plan_observer:
@@ -509,7 +540,13 @@ def ChemEagle_OS(
     else:
         plan_to_execute = serialized_calls
 
-    print(f"[OS_D] plan_to_execute:{plan_to_execute}")
+    tool_preflight = build_asset_preflight_report(
+        mode="open-source",
+        ocr_backend=os.getenv("OCR_BACKEND", "auto"),
+        file_kind="image",
+        selected_tools=[item.get("name", "") for item in plan_to_execute],
+    )
+    _debug_print(f"[OS_D] plan_to_execute:{plan_to_execute}")
     execution_logs = []
     results = []
 
@@ -524,11 +561,17 @@ def ChemEagle_OS(
         tool_call_id = plan_item.get("id") or f"observer_call_{idx}"
         tool_args = _normalize_tool_args(plan_item.get("arguments", {}), image_path)
 
-        if tool_name in TOOL_MAP:
-            tool_func = TOOL_MAP[tool_name]
-            tool_result = tool_func(**tool_args)
-        else:
+        if tool_name not in TOOL_MAP:
             raise ValueError(f"Unknown tool called: {tool_name}")
+        tool_func = TOOL_MAP[tool_name]
+        try:
+            tool_result = tool_func(**tool_args)
+        except Exception as exc:
+            if tool_name == "text_extraction_agent":
+                tool_result = _tool_unavailable_payload(tool_name, tool_args, exc)
+                tool_result["asset_preflight"] = tool_preflight
+            else:
+                raise
 
         execution_logs.append({
             "id": tool_call_id,
