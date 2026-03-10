@@ -75,6 +75,39 @@ def _get_toolkit() -> ChemIEToolkit:
         print(f"[ChemEagle] Molecular agent runtime using {device.type.upper()}.")
     return _RUNTIME_TOOLKIT
 
+
+def _normalize_bbox_key(bbox, digits=3):
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        return tuple(round(float(value), digits) for value in bbox)
+    except (TypeError, ValueError):
+        return None
+
+
+def _find_matching_bbox_index(orig_bboxes, bbox, exact_lookup=None, tolerance=0.02):
+    bbox_key = _normalize_bbox_key(bbox)
+    if bbox_key is None:
+        return None
+    if exact_lookup and bbox_key in exact_lookup:
+        return exact_lookup[bbox_key]
+
+    best_idx = None
+    best_distance = None
+    for idx, candidate in enumerate(orig_bboxes):
+        candidate_key = _normalize_bbox_key(candidate.get("bbox"))
+        if candidate_key is None:
+            continue
+        distance = max(abs(lhs - rhs) for lhs, rhs in zip(candidate_key, bbox_key))
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best_idx = idx
+
+    if best_idx is not None and best_distance is not None and best_distance <= tolerance:
+        return best_idx
+    return None
+
+
 def _get_azure_client():
     return LLMWrapper.from_env(default_model=os.getenv("LLM_MODEL") or "gpt-5-mini").as_chat_completion_client()
 
@@ -819,14 +852,19 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
             orig_bboxes = item2.get('bboxes', [])
             orig_corefs = item2.get('corefs', [])
             # 1. 构造新的bboxes（严格用同bbox作为模板）
-            coord2idx = {tuple(bb['bbox']): i for i, bb in enumerate(orig_bboxes)}
+            coord2idx = {}
+            for i, bb in enumerate(orig_bboxes):
+                bbox_key = _normalize_bbox_key(bb.get('bbox'))
+                if bbox_key is not None and bbox_key not in coord2idx:
+                    coord2idx[bbox_key] = i
             new_bboxes = []
             for bb1 in item1.get('bboxes', []):
-                coord = tuple(bb1['bbox'])
-                if coord in coord2idx:
-                    bb_template = orig_bboxes[coord2idx[coord]]
-                else:
-                    raise ValueError(f"扩展mol时未找到bbox {coord} 的原始模板！")
+                coord = bb1.get('bbox')
+                match_idx = _find_matching_bbox_index(orig_bboxes, coord, coord2idx)
+                if match_idx is None:
+                    print(f"warning: skipping unmatched bbox template {coord}")
+                    continue
+                bb_template = orig_bboxes[match_idx]
                 bb_new = copy.deepcopy(bb_template)
                 if 'symbols' in bb1:
                     bb_new['symbols'] = bb1['symbols']
@@ -844,23 +882,34 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
             # 步骤：找出原组里mol的所有新索引，以及label的新索引，按原corefs分组生成新组
             coord2new_idxs = {}
             for idx, bb in enumerate(new_bboxes):
-                coord = tuple(bb['bbox'])
-                coord2new_idxs.setdefault(coord, []).append(idx)
+                coord = _normalize_bbox_key(bb.get('bbox'))
+                if coord is not None:
+                    coord2new_idxs.setdefault(coord, []).append(idx)
             new_corefs = []
             for group in orig_corefs:
-                # 假设group = [mol_idx, idt_idx] 或 [mol_idx1, mol_idx2, ..., idt_idx]
-                label_idx = group[-1]
-                label_coord = tuple(orig_bboxes[label_idx]['bbox'])
-                new_label_idx = coord2new_idxs[label_coord][-1]  # label只会有一个
-                # 所有mol的扩展后新索引
-                for mol_idx in group[:-1]:
-                    mol_coord = tuple(orig_bboxes[mol_idx]['bbox'])
-                    for new_mol_idx in coord2new_idxs[mol_coord]:
+                if not isinstance(group, (list, tuple)) or len(group) < 2:
+                    continue
+                valid_group = [idx for idx in group if isinstance(idx, int) and 0 <= idx < len(orig_bboxes)]
+                if len(valid_group) < 2:
+                    continue
+                label_idx = valid_group[-1]
+                label_coord = _normalize_bbox_key(orig_bboxes[label_idx].get('bbox'))
+                if label_coord is None or label_coord not in coord2new_idxs:
+                    continue
+                new_label_idx = coord2new_idxs[label_coord][-1]
+                for mol_idx in valid_group[:-1]:
+                    mol_coord = _normalize_bbox_key(orig_bboxes[mol_idx].get('bbox'))
+                    if mol_coord is None:
+                        continue
+                    for new_mol_idx in coord2new_idxs.get(mol_coord, []):
                         new_corefs.append([new_mol_idx, new_label_idx])
             # 3. 装配结构
             new_item = copy.deepcopy(item2)
-            new_item['bboxes'] = new_bboxes
-            new_item['corefs'] = new_corefs
+            if new_bboxes:
+                new_item['bboxes'] = new_bboxes
+                new_item['corefs'] = new_corefs
+            else:
+                print("warning: no matched bbox templates found; keeping original molecular corefs")
             results.append(new_item)
         return results
 
@@ -1103,14 +1152,19 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
             orig_bboxes = item2.get('bboxes', [])
             orig_corefs = item2.get('corefs', [])
             # 1. 构造新的bboxes（严格用同bbox作为模板）
-            coord2idx = {tuple(bb['bbox']): i for i, bb in enumerate(orig_bboxes)}
+            coord2idx = {}
+            for i, bb in enumerate(orig_bboxes):
+                bbox_key = _normalize_bbox_key(bb.get('bbox'))
+                if bbox_key is not None and bbox_key not in coord2idx:
+                    coord2idx[bbox_key] = i
             new_bboxes = []
             for bb1 in item1.get('bboxes', []):
-                coord = tuple(bb1['bbox'])
-                if coord in coord2idx:
-                    bb_template = orig_bboxes[coord2idx[coord]]
-                else:
-                    raise ValueError(f"扩展mol时未找到bbox {coord} 的原始模板！")
+                coord = bb1.get('bbox')
+                match_idx = _find_matching_bbox_index(orig_bboxes, coord, coord2idx)
+                if match_idx is None:
+                    print(f"warning: skipping unmatched bbox template {coord}")
+                    continue
+                bb_template = orig_bboxes[match_idx]
                 bb_new = copy.deepcopy(bb_template)
                 if 'symbols' in bb1:
                     bb_new['symbols'] = bb1['symbols']
@@ -1128,23 +1182,34 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
             # 步骤：找出原组里mol的所有新索引，以及label的新索引，按原corefs分组生成新组
             coord2new_idxs = {}
             for idx, bb in enumerate(new_bboxes):
-                coord = tuple(bb['bbox'])
-                coord2new_idxs.setdefault(coord, []).append(idx)
+                coord = _normalize_bbox_key(bb.get('bbox'))
+                if coord is not None:
+                    coord2new_idxs.setdefault(coord, []).append(idx)
             new_corefs = []
             for group in orig_corefs:
-                # 假设group = [mol_idx, idt_idx] 或 [mol_idx1, mol_idx2, ..., idt_idx]
-                label_idx = group[-1]
-                label_coord = tuple(orig_bboxes[label_idx]['bbox'])
-                new_label_idx = coord2new_idxs[label_coord][-1]  # label只会有一个
-                # 所有mol的扩展后新索引
-                for mol_idx in group[:-1]:
-                    mol_coord = tuple(orig_bboxes[mol_idx]['bbox'])
-                    for new_mol_idx in coord2new_idxs[mol_coord]:
+                if not isinstance(group, (list, tuple)) or len(group) < 2:
+                    continue
+                valid_group = [idx for idx in group if isinstance(idx, int) and 0 <= idx < len(orig_bboxes)]
+                if len(valid_group) < 2:
+                    continue
+                label_idx = valid_group[-1]
+                label_coord = _normalize_bbox_key(orig_bboxes[label_idx].get('bbox'))
+                if label_coord is None or label_coord not in coord2new_idxs:
+                    continue
+                new_label_idx = coord2new_idxs[label_coord][-1]
+                for mol_idx in valid_group[:-1]:
+                    mol_coord = _normalize_bbox_key(orig_bboxes[mol_idx].get('bbox'))
+                    if mol_coord is None:
+                        continue
+                    for new_mol_idx in coord2new_idxs.get(mol_coord, []):
                         new_corefs.append([new_mol_idx, new_label_idx])
             # 3. 装配结构
             new_item = copy.deepcopy(item2)
-            new_item['bboxes'] = new_bboxes
-            new_item['corefs'] = new_corefs
+            if new_bboxes:
+                new_item['bboxes'] = new_bboxes
+                new_item['corefs'] = new_corefs
+            else:
+                print("warning: no matched bbox templates found; keeping original molecular corefs")
             results.append(new_item)
         return results
 

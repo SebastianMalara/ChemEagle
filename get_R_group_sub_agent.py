@@ -78,6 +78,16 @@ def _normalize_chat_message(message) -> dict:
 def _get_azure_client():
     return LLMWrapper.from_env(default_model=os.getenv("LLM_MODEL") or "gpt-5-mini").as_chat_completion_client()
 
+
+def _extract_valid_coref_entries(bboxes, group):
+    if not isinstance(group, (list, tuple)):
+        return []
+    valid_entries = []
+    for raw_idx in group:
+        if isinstance(raw_idx, int) and 0 <= raw_idx < len(bboxes):
+            valid_entries.append((raw_idx, bboxes[raw_idx]))
+    return valid_entries
+
 def normalize_product_variant_output(data: dict) -> dict:
    
     if not isinstance(data, dict):
@@ -414,18 +424,23 @@ def extract_json_from_text_with_reasoning(text):
 
 
 def parse_coref_data_with_fallback(data):
-    bboxes = data["bboxes"]
-    corefs = data["corefs"]
+    bboxes = data.get("bboxes", [])
+    corefs = data.get("corefs", [])
     paired_indices = set()
 
     # 先处理有 coref 配对的
     results = []
-    for idx1, idx2 in corefs:
-        smiles_entry = bboxes[idx1] if "smiles" in bboxes[idx1] else bboxes[idx2]
-        text_entry = bboxes[idx2] if "text" in bboxes[idx2] else bboxes[idx1]
+    for group in corefs:
+        valid_entries = _extract_valid_coref_entries(bboxes, group)
+        if not valid_entries:
+            continue
+
+        smiles_entry = next((entry for _, entry in valid_entries if "smiles" in entry), None)
+        text_entry = next((entry for _, entry in valid_entries if "text" in entry), None)
+        if smiles_entry is None:
+            continue
 
         smiles = smiles_entry.get("smiles", "")
-        #bbox= smiles_entry.get("bbox", ())
         bbox_id = smiles_entry.get("bbox_id", "")
         
         # 如果 smiles_entry 有 sub_text，直接使用 sub_text；否则使用 text_entry 的 text
@@ -433,23 +448,19 @@ def parse_coref_data_with_fallback(data):
             result_item = {
                 "smiles": smiles,
                 "text": smiles_entry["sub_text"],
-                #"bbox": bbox,
                 "bbox_id": bbox_id
             }
         else:
-            texts = text_entry.get("text", [])
+            texts = text_entry.get("text", []) if text_entry else []
             result_item = {
                 "smiles": smiles,
-                "texts": texts,
-                #"bbox": bbox,
+                "texts": texts or ["There is no label or failed to detect, please recheck the image again"],
                 "bbox_id": bbox_id
             }
         
         results.append(result_item)
 
-        # 记录下哪些 SMILES 被配对过了
-        paired_indices.add(idx1)
-        paired_indices.add(idx2)
+        paired_indices.update(idx for idx, _ in valid_entries)
 
     # 处理未配对的 SMILES（补充进来）
     for idx, entry in enumerate(bboxes):
@@ -459,44 +470,46 @@ def parse_coref_data_with_fallback(data):
                 result_item = {
                     "smiles": entry["smiles"],
                     "text": entry["sub_text"],
-                    #"bbox": entry["bbox"],
-                    "bbox_id": entry["bbox_id"],
+                    "bbox_id": entry.get("bbox_id", ""),
                 }
             else:
                 result_item = {
                     "smiles": entry["smiles"],
                     "texts": ["There is no label or failed to detect, please recheck the image again"],
-                    #"bbox": entry["bbox"],
-                    "bbox_id": entry["bbox_id"],
+                    "bbox_id": entry.get("bbox_id", ""),
                 }
             results.append(result_item)
 
     return results
 
 def parse_coref_data_with_fallback_with_box(data):
-    bboxes = data["bboxes"]
-    corefs = data["corefs"]
+    bboxes = data.get("bboxes", [])
+    corefs = data.get("corefs", [])
     paired_indices = set()
 
     # 先处理有 coref 配对的
     results = []
-    for idx1, idx2 in corefs:
-        smiles_entry = bboxes[idx1] if "smiles" in bboxes[idx1] else bboxes[idx2]
-        text_entry = bboxes[idx2] if "text" in bboxes[idx2] else bboxes[idx1]
+    for group in corefs:
+        valid_entries = _extract_valid_coref_entries(bboxes, group)
+        if not valid_entries:
+            continue
+
+        smiles_entry = next((entry for _, entry in valid_entries if "smiles" in entry), None)
+        text_entry = next((entry for _, entry in valid_entries if "text" in entry), None)
+        if smiles_entry is None:
+            continue
 
         smiles = smiles_entry.get("smiles", "")
-        bboxes = smiles_entry.get("bbox", [])
-        texts = text_entry.get("text", [])
+        bbox_coords = smiles_entry.get("bbox", [])
+        texts = text_entry.get("text", []) if text_entry else []
 
         results.append({
             "smiles": smiles,
-            "texts": texts,
-            "bbox": bboxes
+            "texts": texts or ["There is no label or failed to detect, please recheck the image again"],
+            "bbox": bbox_coords
         })
 
-        # 记录下哪些 SMILES 被配对过了
-        paired_indices.add(idx1)
-        paired_indices.add(idx2)
+        paired_indices.update(idx for idx, _ in valid_entries)
 
     # 处理未配对的 SMILES（补充进来）
     for idx, entry in enumerate(bboxes):

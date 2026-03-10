@@ -45,6 +45,8 @@ ENV_KEYS = [
     "OCR_CONFIG",
     "TESSERACT_CMD",
     "PDF_MODEL_SIZE",
+    "PDF_PERSIST_IMAGES",
+    "PDF_PERSIST_DIR",
     "API_KEY",
     "AZURE_ENDPOINT",
     "API_VERSION",
@@ -150,6 +152,8 @@ def build_runtime_values(
     ocr_config: str,
     tesseract_cmd: str,
     pdf_model_size: str,
+    pdf_persist_images: bool,
+    pdf_persist_dir: str,
 ) -> Dict[str, str]:
     return {
         "CHEMEAGLE_RUN_MODE": mode,
@@ -180,6 +184,8 @@ def build_runtime_values(
         "OCR_CONFIG": ocr_config,
         "TESSERACT_CMD": tesseract_cmd,
         "PDF_MODEL_SIZE": pdf_model_size,
+        "PDF_PERSIST_IMAGES": "1" if pdf_persist_images else "0",
+        "PDF_PERSIST_DIR": pdf_persist_dir,
     }
 
 
@@ -298,6 +304,8 @@ def _build_values_from_form(
     ocr_config: str,
     tesseract_cmd: str,
     pdf_model_size: str,
+    pdf_persist_images: bool,
+    pdf_persist_dir: str,
 ) -> Dict[str, str]:
     return build_runtime_values(
         mode,
@@ -328,7 +336,25 @@ def _build_values_from_form(
         ocr_config,
         tesseract_cmd,
         pdf_model_size,
+        pdf_persist_images,
+        pdf_persist_dir,
     )
+
+
+def _resolve_pdf_persist_dir(pdf_path: str, persist_dir: str) -> Path:
+    pdf_stem = Path(pdf_path).stem or "pdf"
+    if persist_dir.strip():
+        base_dir = Path(persist_dir).expanduser()
+        target_dir = base_dir / pdf_stem
+        counter = 1
+        while target_dir.exists():
+            target_dir = base_dir / f"{pdf_stem}-{counter}"
+            counter += 1
+        return target_dir
+
+    default_base = Path("debug") / "pdf_images"
+    default_base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f"{pdf_stem}-", dir=str(default_base)))
 
 
 def _trim_text(text: str, limit: int = 1200) -> str:
@@ -712,11 +738,24 @@ def _release_gpu_memory() -> None:
     gc.collect()
 
 
-def _run_on_pdf(pdf_path: str, mode: str, pdf_model_size: str) -> List[dict]:
+def _run_on_pdf(
+    pdf_path: str,
+    mode: str,
+    pdf_model_size: str,
+    *,
+    persist_images: bool = False,
+    persist_dir: str = "",
+) -> Tuple[List[dict], str]:
     from pdf_extraction import run_pdf
 
+    persisted_dir = ""
     with tempfile.TemporaryDirectory(prefix="chemeagle_pdf_") as tmpdir:
         run_pdf(pdf_dir=pdf_path, image_dir=tmpdir, model_size=pdf_model_size)
+        if persist_images:
+            target_dir = _resolve_pdf_persist_dir(pdf_path, persist_dir)
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(tmpdir, target_dir, dirs_exist_ok=True)
+            persisted_dir = str(target_dir.resolve())
         results: List[dict] = []
         for fname in sorted(os.listdir(tmpdir)):
             if not fname.lower().endswith(".png"):
@@ -728,7 +767,7 @@ def _run_on_pdf(pdf_path: str, mode: str, pdf_model_size: str) -> List[dict]:
                 results.append(result)
             except Exception as exc:
                 results.append({"image_name": fname, "error": str(exc)})
-        return results
+        return results, persisted_dir
 
 
 def _refresh_model_catalog(scope: str, current_model: str, values: Dict[str, str]):
@@ -792,6 +831,8 @@ def refresh_main_models(
     ocr_config: str,
     tesseract_cmd: str,
     pdf_model_size: str,
+    pdf_persist_images: bool,
+    pdf_persist_dir: str,
 ):
     values = _build_values_from_form(
         mode,
@@ -822,6 +863,8 @@ def refresh_main_models(
         ocr_config,
         tesseract_cmd,
         pdf_model_size,
+        pdf_persist_images,
+        pdf_persist_dir,
     )
     return _refresh_model_catalog("main", llm_model, values)
 
@@ -858,6 +901,8 @@ def refresh_ocr_models(
     ocr_config: str,
     tesseract_cmd: str,
     pdf_model_size: str,
+    pdf_persist_images: bool,
+    pdf_persist_dir: str,
 ):
     values = _build_values_from_form(
         mode,
@@ -888,6 +933,8 @@ def refresh_ocr_models(
         ocr_config,
         tesseract_cmd,
         pdf_model_size,
+        pdf_persist_images,
+        pdf_persist_dir,
     )
     return _refresh_model_catalog("ocr", ocr_llm_model, values)
 
@@ -924,6 +971,8 @@ def run_preflight(
     ocr_config: str,
     tesseract_cmd: str,
     pdf_model_size: str,
+    pdf_persist_images: bool,
+    pdf_persist_dir: str,
 ) -> Tuple[str, str, str]:
     env_path = Path(env_path_str).expanduser() if env_path_str else ENV_FILE_DEFAULT
     values = _build_values_from_form(
@@ -955,6 +1004,8 @@ def run_preflight(
         ocr_config,
         tesseract_cmd,
         pdf_model_size,
+        pdf_persist_images,
+        pdf_persist_dir,
     )
     status_bits = [f"Runtime env applied from form. mode={mode}"]
     apply_runtime_env(values)
@@ -1004,6 +1055,8 @@ def run_pipeline(
     ocr_config: str,
     tesseract_cmd: str,
     pdf_model_size: str,
+    pdf_persist_images: bool,
+    pdf_persist_dir: str,
 ) -> Tuple[str, str, str]:
     env_path = Path(env_path_str).expanduser() if env_path_str else ENV_FILE_DEFAULT
     values = _build_values_from_form(
@@ -1035,6 +1088,8 @@ def run_pipeline(
         ocr_config,
         tesseract_cmd,
         pdf_model_size,
+        pdf_persist_images,
+        pdf_persist_dir,
     )
     status_bits = [f"Runtime env applied from form. mode={mode}"]
 
@@ -1067,7 +1122,15 @@ def run_pipeline(
 
     try:
         if suffix == ".pdf":
-            result = _run_on_pdf(file_path, mode, values.get("PDF_MODEL_SIZE") or "large")
+            result, persisted_pdf_dir = _run_on_pdf(
+                file_path,
+                mode,
+                values.get("PDF_MODEL_SIZE") or "large",
+                persist_images=_env_truthy(values.get("PDF_PERSIST_IMAGES")),
+                persist_dir=values.get("PDF_PERSIST_DIR", ""),
+            )
+            if persisted_pdf_dir:
+                status_bits.append(f"Persisted extracted PDF images to: {persisted_pdf_dir}")
         elif suffix in IMAGE_SUFFIXES:
             result = _run_on_image(file_path, mode)
         else:
@@ -1303,6 +1366,16 @@ def build_app() -> gr.Blocks:
                         value=vals.get("PDF_MODEL_SIZE", "large") or "large",
                         label="PDF_MODEL_SIZE",
                     )
+                with gr.Row():
+                    pdf_persist_images = gr.Checkbox(
+                        label="Persist extracted PDF images",
+                        value=_env_truthy(vals.get("PDF_PERSIST_IMAGES", "")),
+                    )
+                    pdf_persist_dir = gr.Textbox(
+                        label="PDF_PERSIST_DIR",
+                        value=vals.get("PDF_PERSIST_DIR", ""),
+                        placeholder="Optional folder for debug PNGs; defaults to ./debug/pdf_images/",
+                    )
 
         with gr.Group():
             gr.Markdown("## Output")
@@ -1343,6 +1416,8 @@ def build_app() -> gr.Blocks:
             ocr_config,
             tesseract_cmd,
             pdf_model_size,
+            pdf_persist_images,
+            pdf_persist_dir,
         ]
         ocr_control_inputs = [ocr_llm_inherit_main, llm_provider, llm_model, ocr_llm_provider, ocr_llm_model]
         ocr_control_outputs = [
