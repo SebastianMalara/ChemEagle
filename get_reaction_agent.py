@@ -21,6 +21,14 @@ from typing import Optional
 import time
 from asset_registry import ensure_asset_available
 from llm_wrapper import LLMWrapper
+from runtime_guards import (
+    RuntimeStageError,
+    assistant_message as guarded_assistant_message,
+    first_dict_item,
+    message_content,
+    safe_json_loads,
+    tool_calls_or_empty,
+)
 from runtime_device import resolve_torch_device
 
 def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
@@ -107,14 +115,19 @@ def get_reaction(image_path: str) -> dict:
 
     image_file = image_path
     raw_prediction = _get_rxnim().predict_image_file(image_file, molnextr=True, ocr=True)
+    raw_root = first_dict_item(
+        raw_prediction,
+        context="reaction_agent.predict_image_file",
+        retry_trigger="auto_recovery_retry",
+    )
     #print(f'raw_prediction:{raw_prediction}')
 
     # Ensure raw_prediction is treated as a list directly
     structured_output = {}
     for section_key in ['reactants', 'conditions', 'products']:
-        if section_key in raw_prediction[0]:
+        if section_key in raw_root:
             structured_output[section_key] = []
-            for item in raw_prediction[0][section_key]:
+            for item in raw_root[section_key]:
                 if section_key in ['reactants', 'products']:
                     # Extract smiles and bbox for molecules
                     structured_output[section_key].append({
@@ -248,7 +261,18 @@ def get_reaction_withatoms(image_path: str) -> dict:
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls
+    assistant_message = guarded_assistant_message(
+        response,
+        context="reaction_agent.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="reaction_agent.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="reaction_agent.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -297,7 +321,7 @@ def get_reaction_withatoms(image_path: str) -> dict:
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -312,7 +336,16 @@ def get_reaction_withatoms(image_path: str) -> dict:
 
     
     # 获取 GPT 生成的结果
-    gpt_output = json.loads(response.choices[0].message.content)
+    gpt_output = safe_json_loads(
+        message_content(
+            response,
+            context="reaction_agent.final_response",
+            required=True,
+            retry_trigger="auto_recovery_retry",
+        ),
+        context="reaction_agent.final_response",
+        retry_trigger="auto_recovery_retry",
+    )
     #print(f"gpt_output1:{gpt_output}")
 
     
@@ -366,7 +399,13 @@ def get_reaction_withatoms(image_path: str) -> dict:
 
         return input2
     
-    updated_data = [update_input_with_symbols(gpt_output, input2[0], _convert_graph_to_smiles)]
+    updated_data = [
+        update_input_with_symbols(
+            gpt_output,
+            first_dict_item(input2, context="reaction_agent.get_reaction_full", retry_trigger="auto_recovery_retry"),
+            _convert_graph_to_smiles,
+        )
+    ]
 
     return updated_data
 
@@ -460,7 +499,18 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls
+    assistant_message = guarded_assistant_message(
+        response,
+        context="reaction_agent_correctR.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="reaction_agent_correctR.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="reaction_agent_correctR.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -509,7 +559,7 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -524,7 +574,16 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
 
     
     # 获取 GPT 生成的结果
-    gpt_output = json.loads(response.choices[0].message.content)
+    gpt_output = safe_json_loads(
+        message_content(
+            response,
+            context="reaction_agent_correctR.final_response",
+            required=True,
+            retry_trigger="auto_recovery_retry",
+        ),
+        context="reaction_agent_correctR.final_response",
+        retry_trigger="auto_recovery_retry",
+    )
     print(f"gpt_output_rxn:{gpt_output}")
 
     
@@ -583,7 +642,13 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
 
         return input2
     
-    updated_data = [update_input_with_symbols(gpt_output, input2[0], _convert_graph_to_smiles)]
+    updated_data = [
+        update_input_with_symbols(
+            gpt_output,
+            first_dict_item(input2, context="reaction_agent_correctR_os.get_reaction_full", retry_trigger="auto_recovery_retry"),
+            _convert_graph_to_smiles,
+        )
+    ]
     print(f"rxn_agent_output:{updated_data}")
 
     return updated_data
@@ -668,7 +733,18 @@ def get_reaction_withatoms_correctR_OS(
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls or []
+    assistant_message = guarded_assistant_message(
+        response,
+        context="reaction_agent_os.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="reaction_agent_os.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="reaction_agent_os.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -716,7 +792,7 @@ def get_reaction_withatoms_correctR_OS(
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -735,7 +811,12 @@ def get_reaction_withatoms_correctR_OS(
     # 获取 GPT 生成的结果（支持从包含思考过程的文本中提取）
     from get_R_group_sub_agent import extract_json_from_text_with_reasoning
     
-    raw_content = response.choices[0].message.content
+    raw_content = message_content(
+        response,
+        context="reaction_agent_os.final_response",
+        required=True,
+        retry_trigger="auto_recovery_retry",
+    )
     
     try:
         # 首先尝试直接解析
@@ -811,7 +892,13 @@ def get_reaction_withatoms_correctR_OS(
 
         return input2
     
-    updated_data = [update_input_with_symbols(gpt_output, input2[0], _convert_graph_to_smiles)]
+    updated_data = [
+        update_input_with_symbols(
+            gpt_output,
+            first_dict_item(input2, context="reaction_agent_os.get_reaction_full", retry_trigger="auto_recovery_retry"),
+            _convert_graph_to_smiles,
+        )
+    ]
     print(f"rxn_agent_output:{updated_data}")
 
     return updated_data

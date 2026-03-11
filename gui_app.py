@@ -1375,7 +1375,6 @@ def refresh_main_models(
     env_path_str: str,
     mode: str,
     chemeagle_device: str,
-    upload,
     save_env: bool,
     llm_provider: str,
     llm_model: str,
@@ -1445,7 +1444,6 @@ def refresh_ocr_models(
     env_path_str: str,
     mode: str,
     chemeagle_device: str,
-    upload,
     save_env: bool,
     llm_provider: str,
     llm_model: str,
@@ -2198,10 +2196,16 @@ def reprocess_run_view(run_id: str, review_db_path: str) -> str:
     )
 
 
-def retry_selected_derived_image_view(derived_image_id: str, review_db_path: str) -> str:
+def retry_selected_derived_image_view(derived_image_id: str, retry_mode: str, review_db_path: str) -> str:
     if not derived_image_id:
         return "No derived image selected."
-    return get_review_service(review_db_path).retry_derived_image(derived_image_id)
+    execution_mode = retry_mode or "normal"
+    trigger = "manual_no_agents_retry" if execution_mode == "no_agents" else "manual_retry"
+    return get_review_service(review_db_path).retry_derived_image(
+        derived_image_id,
+        trigger=trigger,
+        execution_mode=execution_mode,
+    )
 
 
 def reprocess_selected_derived_image_view(derived_image_id: str, review_db_path: str) -> str:
@@ -2360,10 +2364,10 @@ def build_app() -> gr.Blocks:
 
     with gr.Blocks(title="ChemEagle Self-Hosted GUI") as demo:
         gr.Markdown("# ChemEagle Self-Hosted GUI")
-        gr.Markdown("Configure the run mode, provider profiles, OCR backend, PDF extraction settings, and storage before launching single runs or review datasets.")
+        gr.Markdown("Configure the run mode, provider profiles, OCR backend, PDF extraction settings, and storage before launching runs and review datasets.")
 
         with gr.Accordion("Setting", open=True):
-            gr.Markdown("Global configuration shared by single runs and batch dataset workflows.")
+            gr.Markdown("Global configuration shared by batch runs and dataset workflows.")
             with gr.Row():
                 env_path = gr.Textbox(label="Env file path", value=str(ENV_FILE_DEFAULT), scale=3)
                 env_path_picker = gr.FileExplorer(
@@ -2625,22 +2629,11 @@ def build_app() -> gr.Blocks:
                             value=_env_truthy(vals.get("ARTIFACT_S3_USE_SSL", "")),
                         )
 
-        with gr.Accordion("Single Run", open=False):
-            gr.Markdown("Run the current ChemEagle pipeline on one image or one PDF.")
-            upload = gr.File(label="Upload image or PDF", file_count="single")
-            with gr.Row():
-                preflight_btn = gr.Button("Run Precheck")
-                run_btn = gr.Button("Run ChemEagle", variant="primary")
-            single_status = gr.Textbox(label="Status", lines=12)
-            with gr.Row():
-                single_output = gr.Code(label="JSON output", language="json")
-                single_diagnostics = gr.Code(label="Diagnostics / preflight", language="json")
-
         with gr.Accordion("Batch Run and Dataset Creation", open=False):
             gr.Markdown("Create comparison experiments, sideload older JSON runs, inspect run metrics, and review extracted reactions.")
             with gr.Tabs():
                 with gr.Tab("Ingest"):
-                    gr.Markdown("Queue new comparison experiments from live files/folders or sideload raw JSON from previous unstored runs.")
+                    gr.Markdown("Queue new experiments from live files or folders, including a batch of one file, or sideload raw JSON from previous unstored runs.")
                     experiment_name = gr.Textbox(label="Experiment name", value="ChemEagle Review Experiment")
                     experiment_notes = gr.Textbox(label="Experiment notes", lines=2)
                     comparison_profiles_json = gr.Code(
@@ -2751,6 +2744,11 @@ def build_app() -> gr.Blocks:
                     runs_recovery_status = gr.Textbox(label="Recovery status", lines=2)
                     with gr.Row():
                         runs_derived_image_id = gr.Dropdown(label="Derived image")
+                        runs_retry_mode = gr.Dropdown(
+                            label="Retry mode",
+                            choices=["normal", "no_agents", "recovery"],
+                            value="normal",
+                        )
                         retry_selected_btn = gr.Button("Retry selected derived image")
                         reprocess_selected_btn = gr.Button("Reprocess selected derived image")
                     runs_attempts_table = gr.Dataframe(label="Attempt history for selected derived image", interactive=False)
@@ -2803,11 +2801,10 @@ def build_app() -> gr.Blocks:
                     review_save_status = gr.Textbox(label="Review save status", lines=2)
                     review_save_json = gr.Code(label="Saved review payload", language="json")
 
-        app_inputs = [
+        settings_inputs = [
             env_path,
             mode,
             chemeagle_device,
-            upload,
             save_env,
             llm_provider,
             llm_model,
@@ -2945,16 +2942,6 @@ def build_app() -> gr.Blocks:
             ingest_run_id,
         ]
 
-        run_btn.click(
-            fn=run_pipeline,
-            inputs=app_inputs,
-            outputs=[single_status, single_output, single_diagnostics],
-        )
-        preflight_btn.click(
-            fn=run_preflight,
-            inputs=app_inputs,
-            outputs=[single_status, single_output, single_diagnostics],
-        )
         queue_live_event = queue_live_btn.click(
             fn=submit_live_dataset,
             inputs=dataset_common_inputs + [experiment_name, experiment_notes, batch_folder_path, batch_upload, comparison_profiles_json],
@@ -3012,12 +2999,12 @@ def build_app() -> gr.Blocks:
         )
         refresh_main_btn.click(
             fn=refresh_main_models,
-            inputs=app_inputs,
+            inputs=settings_inputs,
             outputs=[llm_model, llm_model_status],
         )
         refresh_ocr_btn.click(
             fn=refresh_ocr_models,
-            inputs=app_inputs,
+            inputs=settings_inputs,
             outputs=[ocr_llm_model, ocr_model_status],
         )
         llm_provider.change(
@@ -3122,7 +3109,7 @@ def build_app() -> gr.Blocks:
         )
         retry_selected_btn.click(
             fn=retry_selected_derived_image_view,
-            inputs=[runs_derived_image_id, review_db_path],
+            inputs=[runs_derived_image_id, runs_retry_mode, review_db_path],
             outputs=[runs_recovery_status],
         ).then(
             fn=refresh_runs_view,

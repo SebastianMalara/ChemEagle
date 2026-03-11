@@ -294,9 +294,160 @@ class ReviewServiceTests(unittest.TestCase):
             self.assertEqual(len(reactions), 1)
             detail = service.get_run_source_monitor(run_source_id)
             derived = detail["derived_images"][0]
-            self.assertEqual(derived["attempt_count"], 2)
+            self.assertEqual(derived["attempt_count"], 3)
             self.assertEqual(derived["accepted_reaction_count"], 1)
             self.assertEqual(derived["normalization_status"], "accepted")
+            self.assertEqual(derived["attempts"][-1]["execution_mode"], "recovery")
+
+    def test_retry_derived_image_manual_no_agents_records_execution_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db_path = tmp / "review.sqlite3"
+            artifact_root = tmp / "artifacts"
+            image_path = tmp / "retry_no_agents.png"
+            Image.new("RGB", (64, 64), "white").save(image_path)
+            store = create_artifact_store_from_config(
+                {"ARTIFACT_BACKEND": "filesystem", "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root)}
+            )
+            artifact_key = "derived/run-source/0.png"
+            store.put_file(artifact_key, str(image_path), content_type="image/png")
+
+            repo = ReviewRepository(db_path)
+            experiment_id = repo.create_experiment(name="exp")
+            run_id = repo.create_run(
+                experiment_id=experiment_id,
+                profile_label="baseline",
+                ingest_mode="live_batch",
+                status="completed",
+                config_snapshot={
+                    "ARTIFACT_BACKEND": "filesystem",
+                    "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root),
+                    "CHEMEAGLE_RUN_MODE": "cloud",
+                },
+                config_hash="hash",
+            )
+            source_asset_id = repo.upsert_source_asset(
+                source_asset_id="source-a",
+                source_type="image",
+                sha256="abc123",
+                original_filename="retry_no_agents.png",
+                artifact_backend="filesystem",
+                artifact_key="sources/source-a/original.png",
+                artifact_status="present",
+            )
+            run_source_id = repo.create_run_source(run_id=run_id, source_asset_id=source_asset_id, input_order=0, source_type="image")
+            derived_image_id = repo.create_derived_image(
+                run_source_id=run_source_id,
+                page_hint="retry_no_agents.png",
+                image_index=0,
+                artifact_backend="filesystem",
+                artifact_key=artifact_key,
+                artifact_status="present",
+                status="failed",
+                outcome_class="failed",
+                raw_artifact_key="",
+                error_text="observer returned empty tool list",
+            )
+            service = ReviewDatasetService(repo)
+            execution_modes: list[str] = []
+            valid_payload = {
+                "reactions": [
+                    {
+                        "reaction_id": "rxn-1",
+                        "reactants": [{"smiles": "CCO", "label": "A"}],
+                        "products": [{"smiles": "CC=O", "label": "B"}],
+                        "conditions": [],
+                    }
+                ]
+            }
+
+            def fake_execute(image_path: str, config: dict, *, execution_mode: str = "normal"):
+                del image_path, config
+                execution_modes.append(execution_mode)
+                return valid_payload, RunMetricsCollector()
+
+            with mock.patch.object(service, "_execute_image_pipeline", side_effect=fake_execute):
+                status = service.retry_derived_image(derived_image_id, execution_mode="no_agents")
+
+            self.assertIn("using no_agents", status)
+            self.assertEqual(execution_modes, ["no_agents"])
+            detail = service.get_run_source_monitor(run_source_id)
+            attempts = detail["derived_images"][0]["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(attempts[0]["execution_mode"], "normal")
+            self.assertEqual(attempts[0]["trigger"], "initial")
+            self.assertEqual(attempts[-1]["execution_mode"], "no_agents")
+            self.assertEqual(attempts[-1]["trigger"], "manual_no_agents_retry")
+
+    def test_live_image_redo_auto_retries_with_no_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db_path = tmp / "review.sqlite3"
+            artifact_root = tmp / "artifacts"
+            image_path = tmp / "scheme.png"
+            Image.new("RGB", (64, 64), "white").save(image_path)
+
+            service = ReviewDatasetService(ReviewRepository(db_path))
+            execution_modes: list[str] = []
+            redo_payload = {
+                "redo": True,
+                "plan": [],
+                "execution_logs": [],
+                "reactions": [],
+            }
+            valid_payload = {
+                "reactions": [
+                    {
+                        "reaction_id": "rxn-1",
+                        "reactants": [{"smiles": "CCO", "label": "A"}],
+                        "products": [{"smiles": "CC=O", "label": "B"}],
+                        "conditions": [],
+                    }
+                ]
+            }
+
+            def fake_execute(image_path: str, config: dict, *, execution_mode: str = "normal"):
+                del image_path, config
+                execution_modes.append(execution_mode)
+                if execution_mode == "normal":
+                    return redo_payload, RunMetricsCollector()
+                if execution_mode == "no_agents":
+                    return valid_payload, RunMetricsCollector()
+                raise AssertionError(f"Unexpected execution mode: {execution_mode}")
+
+            with mock.patch.object(service, "_execute_image_pipeline", side_effect=fake_execute):
+                result = service.submit_live_experiment(
+                    experiment_name="redo batch",
+                    notes="",
+                    source_paths=[str(image_path)],
+                    profile_configs=[
+                        {
+                            "profile_label": "baseline",
+                            "ARTIFACT_BACKEND": "filesystem",
+                            "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root),
+                            "CHEMEAGLE_RUN_MODE": "cloud",
+                        }
+                    ],
+                )
+                service._queue.join()
+
+            runs = service.list_runs(result["experiment_id"])
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["status"], "completed")
+            self.assertEqual(runs[0]["total_reactions"], 1)
+            self.assertEqual(execution_modes, ["normal", "no_agents"])
+
+            run_id = runs[0]["run_id"]
+            sources = service.list_run_sources(run_id)
+            self.assertEqual(len(sources), 1)
+            detail = service.get_run_source_monitor(sources[0]["run_source_id"])
+            derived = detail["derived_images"][0]
+            attempts = derived["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(attempts[0]["execution_mode"], "normal")
+            self.assertEqual(attempts[1]["execution_mode"], "no_agents")
+            self.assertEqual(attempts[1]["trigger"], "auto_no_agents_retry")
+            self.assertEqual(derived["accepted_reaction_count"], 1)
 
     def test_reprocess_normalization_for_run_purges_invalid_canonical_reactions(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -635,21 +635,43 @@ def _retry_backoff_seconds(attempt_no: int) -> float:
     return min(8.0, float(2 ** max(0, attempt_no - 1)))
 
 
-def _should_retry_failure(failure, exc: Exception, attempt_no: int) -> Tuple[bool, str]:
+def _execution_mode_for_trigger(trigger: str, *, fallback: str = "normal") -> str:
+    if trigger in {"auto_no_agents_retry", "manual_no_agents_retry"}:
+        return "no_agents"
+    if trigger in {"auto_recovery_retry", "manual_reprocess"}:
+        return "recovery"
+    return fallback
+
+
+def _should_retry_failure(failure, exc: Exception, attempt_no: int, *, current_execution_mode: str) -> Tuple[bool, str]:
     if attempt_no >= MAX_AUTO_ATTEMPTS_PER_DERIVED_IMAGE:
         return False, "retry_cap_reached"
+    explicit_trigger = str(getattr(exc, "_retry_trigger", "") or "")
+    if explicit_trigger:
+        return True, explicit_trigger
     if failure.kind in TRANSIENT_RETRY_KINDS or failure.retryable:
         return True, "auto_transient_retry"
     if isinstance(exc, LOCAL_RECOVERY_EXCEPTIONS):
+        if current_execution_mode == "no_agents":
+            return True, "auto_recovery_retry"
         return True, "auto_recovery_retry"
     return False, ""
 
 
-def _should_retry_redo(*, payload: Dict[str, Any], normalization: NormalizationSummary, attempt_no: int) -> Tuple[bool, str]:
+def _should_retry_redo(
+    *,
+    payload: Dict[str, Any],
+    normalization: NormalizationSummary,
+    attempt_no: int,
+    current_execution_mode: str,
+) -> Tuple[bool, str]:
     if attempt_no >= MAX_AUTO_ATTEMPTS_PER_DERIVED_IMAGE:
         return False, ""
     if payload.get("redo") and normalization.accepted_reaction_count == 0:
-        return True, "auto_recovery_retry"
+        if current_execution_mode == "normal":
+            return True, "auto_no_agents_retry"
+        if current_execution_mode == "no_agents":
+            return True, "auto_recovery_retry"
     return False, ""
 
 
@@ -896,6 +918,7 @@ class ReviewDatasetService:
         derived_image_id: str,
         *,
         trigger: str = "manual_retry",
+        execution_mode: str = "normal",
         force: bool = False,
     ) -> str:
         detail = self.repository.get_derived_image(derived_image_id)
@@ -915,6 +938,8 @@ class ReviewDatasetService:
             detail=detail,
             config_snapshot=config_snapshot,
         )
+        if execution_mode == "no_agents" and trigger == "manual_retry":
+            trigger = "manual_no_agents_retry"
         store = create_artifact_store_from_config(config_snapshot)
         local_image = _artifact_to_local_path(store, str(detail["artifact_key"]), suffix=Path(str(detail["artifact_key"])).suffix or ".png")
         controller = RunFailureController()
@@ -940,10 +965,14 @@ class ReviewDatasetService:
                 source_name=str(detail.get("original_filename") or detail.get("page_hint") or derived_image_id),
                 run_logger=run_logger,
                 trigger=trigger,
+                execution_mode=execution_mode,
                 max_attempts=max_attempts,
             )
             self._refresh_source_and_run_counts(str(detail["run_source_id"]), str(detail["run_id"]))
-            return f"Retried {derived_image_id}: reactions={result['reaction_count']} failures={result['failure_count']} redo={result['redo_count']}"
+            return (
+                f"Retried {derived_image_id} using {execution_mode}: "
+                f"reactions={result['reaction_count']} failures={result['failure_count']} redo={result['redo_count']}"
+            )
         finally:
             log_session.close()
 
@@ -962,7 +991,17 @@ class ReviewDatasetService:
                 continue
             if status == "failed" and not include_failed:
                 continue
-            self.retry_derived_image(str(row["derived_image_id"]))
+            detail = self.repository.get_derived_image(str(row["derived_image_id"]))
+            attempts = list(detail.get("attempts", []) or [])
+            last_attempt = attempts[-1] if attempts else {}
+            execution_mode = "normal"
+            trigger = "manual_retry"
+            if outcome_class == "needs_redo" or str(row.get("normalization_status") or "") == "redo_pending":
+                execution_mode = "no_agents"
+                trigger = "manual_no_agents_retry"
+            elif str(last_attempt.get("execution_mode") or "") == "no_agents":
+                execution_mode = "recovery"
+            self.retry_derived_image(str(row["derived_image_id"]), trigger=trigger, execution_mode=execution_mode)
             retried.append(str(row["derived_image_id"]))
         return retried
 
@@ -1952,6 +1991,7 @@ class ReviewDatasetService:
         source_name: str,
         run_logger,
         trigger: str = "initial",
+        execution_mode: str = "normal",
         max_attempts: int = MAX_AUTO_ATTEMPTS_PER_DERIVED_IMAGE,
     ) -> Dict[str, Any]:
         self.repository.update_derived_image_status(
@@ -1971,13 +2011,13 @@ class ReviewDatasetService:
         derived_logger.info("derived_image_started", f"Processing derived image {image_index + 1} for {source_name}")
         with bind_log_context(run_source_id=run_source_id, derived_image_id=derived_image_id, phase="process_image"):
             current_trigger = trigger
+            current_execution_mode = execution_mode
             retry_of_attempt_id = ""
             for _ in range(max_attempts):
-                execution_mode = "recovery" if current_trigger in {"auto_recovery_retry", "manual_retry"} else "normal"
                 attempt = self.repository.create_derived_image_attempt(
                     derived_image_id=derived_image_id,
                     trigger=current_trigger,
-                    execution_mode=execution_mode,
+                    execution_mode=current_execution_mode,
                     status="running",
                     config_snapshot_json=_json_dumps(task.config_snapshot),
                     retry_of_attempt_id=retry_of_attempt_id,
@@ -1987,10 +2027,14 @@ class ReviewDatasetService:
                 self.repository.update_derived_image_attempt(attempt_id, started=True)
                 raw_key = ""
                 try:
-                    if execution_mode == "recovery":
+                    if current_execution_mode == "recovery":
                         payload, metrics = self._execute_image_pipeline_recovery_subprocess(str(image_path), task.config_snapshot)
                     else:
-                        payload, metrics = self._execute_image_pipeline(str(image_path), task.config_snapshot)
+                        payload, metrics = self._execute_image_pipeline(
+                            str(image_path),
+                            task.config_snapshot,
+                            execution_mode=current_execution_mode,
+                        )
                     raw_key = f"raw/{task.run_id}/{run_source_id}/image_{image_index}_attempt_{attempt_no}.json"
                     persisted_payload = _rewrite_payload_image_refs(
                         payload,
@@ -2033,6 +2077,7 @@ class ReviewDatasetService:
                         payload=payload,
                         normalization=normalization,
                         attempt_no=attempt_no,
+                        current_execution_mode=current_execution_mode,
                     )
                     if retry_redo:
                         self.repository.update_derived_image_status(
@@ -2058,6 +2103,7 @@ class ReviewDatasetService:
                         )
                         retry_of_attempt_id = attempt_id
                         current_trigger = next_trigger
+                        current_execution_mode = _execution_mode_for_trigger(next_trigger, fallback=current_execution_mode)
                         time.sleep(_retry_backoff_seconds(attempt_no))
                         continue
                     self.repository.finalize_derived_image_summary(
@@ -2091,6 +2137,7 @@ class ReviewDatasetService:
                         rejected_reaction_count=normalization.rejected_reaction_count,
                         normalization_status=normalization.normalization_status,
                         attempt_no=attempt_no,
+                        execution_mode=current_execution_mode,
                     )
                     return {
                         "derived_count": 1,
@@ -2131,7 +2178,12 @@ class ReviewDatasetService:
                             "usage_completeness": metrics_summary["usage_completeness"],
                         },
                     )
-                    should_retry, next_trigger = _should_retry_failure(failure, exc, attempt_no)
+                    should_retry, next_trigger = _should_retry_failure(
+                        failure,
+                        exc,
+                        attempt_no,
+                        current_execution_mode=current_execution_mode,
+                    )
                     if should_retry:
                         self.repository.update_derived_image_status(
                             derived_image_id,
@@ -2151,6 +2203,7 @@ class ReviewDatasetService:
                         )
                         retry_of_attempt_id = attempt_id
                         current_trigger = next_trigger
+                        current_execution_mode = _execution_mode_for_trigger(next_trigger, fallback=current_execution_mode)
                         time.sleep(_retry_backoff_seconds(attempt_no))
                         continue
                     aborted, abort_reason = controller.record(failure, source_index=source_index, source_name=source_name)
@@ -2224,7 +2277,13 @@ class ReviewDatasetService:
                 "error_summary": f"Retry cap exhausted for {source_name}",
             }
 
-    def _execute_image_pipeline(self, image_path: str, config: Dict[str, Any]) -> tuple[Dict[str, Any], RunMetricsCollector]:
+    def _execute_image_pipeline(
+        self,
+        image_path: str,
+        config: Dict[str, Any],
+        *,
+        execution_mode: str = "normal",
+    ) -> tuple[Dict[str, Any], RunMetricsCollector]:
         from main import ChemEagle, ChemEagle_OS
 
         _apply_runtime_env(config)
@@ -2233,7 +2292,10 @@ class ReviewDatasetService:
         try:
             with bind_metrics_collector(collector):
                 mode = str(config.get("mode") or config.get("CHEMEAGLE_RUN_MODE") or "cloud")
-                payload = ChemEagle(image_path) if mode == "cloud" else ChemEagle_OS(image_path)
+                kwargs = {}
+                if execution_mode == "no_agents":
+                    kwargs = {"use_plan_observer": False, "use_action_observer": False}
+                payload = ChemEagle(image_path, **kwargs) if mode == "cloud" else ChemEagle_OS(image_path, **kwargs)
         except Exception as exc:
             setattr(exc, "_metrics_collector", collector)
             raise

@@ -23,6 +23,7 @@ from get_observer import action_observer_agent, plan_observer_agent,action_obser
 from get_text_agent import text_extraction_agent, text_extraction_agent_OS
 from llm_wrapper import LLMWrapper
 from review_tracking import llm_phase
+from runtime_guards import message_content
 
 
 def _normalize_tool_args(raw_args: Optional[dict], image_path: str) -> dict:
@@ -490,7 +491,12 @@ def ChemEagle_OS(
     )
     
     # 解析 planner 返回的 agent 列表
-    planner_output = planner_response.choices[0].message.content.strip()
+    planner_output = message_content(
+        planner_response,
+        context="planner_os",
+        required=True,
+        retry_trigger="auto_no_agents_retry",
+    ).strip()
     _debug_print(f"[OS_D] Planner output: {planner_output}")
     
     # 提取 agent 名称（移除可能的括号、花括号等）
@@ -653,7 +659,12 @@ def ChemEagle_OS(
             messages=completion_payload["messages"],
         )
         print(response)
-        raw_content = response.choices[0].message.content
+        raw_content = message_content(
+            response,
+            context="final_synthesis_os",
+            required=True,
+            retry_trigger="auto_recovery_retry",
+        )
         from get_R_group_sub_agent import extract_json_from_text_with_reasoning
         
         try:

@@ -18,6 +18,7 @@ from openai import OpenAI
 from asset_registry import AssetNotAvailableError, ensure_asset_available
 from llm_wrapper import LLMWrapper
 from review_tracking import llm_phase
+from runtime_guards import assistant_message as guarded_assistant_message, message_content, tool_calls_or_empty
 from runtime_device import (
     easyocr_uses_acceleration,
     resolve_ocr_backend,
@@ -341,7 +342,7 @@ def _repair_json_via_model(client, model_name: str, raw_content: str, max_attemp
                 messages=repair_messages,
                 response_format={"type": "json_object"},
             )
-        candidate = response.choices[0].message.content or ""
+        candidate = message_content(response, context="text_agent_json_repair", default="")
         parsed = _extract_json_from_text(candidate)
         if parsed is not None:
             if attempt > 0:
@@ -626,13 +627,17 @@ Here is my step-by-step analysis:
     )
 
     # Get assistant message with tool calls
-    assistant_message = response1.choices[0].message
+    assistant_message = guarded_assistant_message(response1, context="text_agent_cloud_tool_selection")
     
     # Execute each requested tool
-    tool_calls = assistant_message.tool_calls
+    tool_calls = tool_calls_or_empty(assistant_message, context="text_agent_cloud_tool_selection")
     if not tool_calls:
         # If no tool calls, return the response directly
-        return _safe_parse_agent_json(client, model_name, response1.choices[0].message.content)
+        return _safe_parse_agent_json(
+            client,
+            model_name,
+            message_content(response1, context="text_agent_cloud_direct_response", default=""),
+        )
     
     tool_results_msgs = []
     for call in tool_calls:
@@ -665,7 +670,11 @@ Here is my step-by-step analysis:
         #           response_format={"type": "json_object"}
     )
 
-    return _safe_parse_agent_json(client, model_name, response2.choices[0].message.content)
+    return _safe_parse_agent_json(
+        client,
+        model_name,
+        message_content(response2, context="text_agent_cloud_final_response", default=""),
+    )
 
 
 def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
@@ -859,13 +868,13 @@ Here is my step-by-step analysis:
             raise
 
     # Get assistant message with tool calls
-    assistant_message = response1.choices[0].message
+    assistant_message = guarded_assistant_message(response1, context="text_agent_os_tool_selection")
     
     # Execute each requested tool
-    tool_calls = assistant_message.tool_calls
+    tool_calls = tool_calls_or_empty(assistant_message, context="text_agent_os_tool_selection")
     if not tool_calls:
         # If no tool calls, try to parse response directly
-        raw_content = response1.choices[0].message.content
+        raw_content = message_content(response1, context="text_agent_os_direct_response", default="")
         if raw_content:
             try:
                 return json.loads(raw_content)
@@ -917,7 +926,7 @@ Here is my step-by-step analysis:
     )
 
     # Parse response (support extracting JSON from text with reasoning)
-    raw_content = response2.choices[0].message.content
+    raw_content = message_content(response2, context="text_agent_os_final_response", default="")
     
     try:
         # First try direct JSON parsing

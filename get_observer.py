@@ -7,6 +7,7 @@ from typing import Any, List, Optional
 from openai import OpenAI
 from openai import InternalServerError, RateLimitError, APIError
 from llm_wrapper import LLMWrapper
+from runtime_guards import message_content
 
 
 _client = None
@@ -259,7 +260,9 @@ def plan_observer_agent_OS(
             ],
                         # response_format={"type": "json_object"},  # vLLM 可能不支持
         )
-        content = response.choices[0].message.content
+        content = message_content(response, context="plan_observer_os", default="")
+        if not content:
+            return tool_calls
         
         # Try to parse JSON directly
         try:
@@ -338,7 +341,9 @@ def action_observer_agent_OS(
             ],
                         # response_format={"type": "json_object"},  # vLLM 可能不支持
         )
-        content = response.choices[0].message.content
+        content = message_content(response, context="action_observer_os", default="")
+        if not content:
+            return False
         
         # Try to parse JSON directly
         try:

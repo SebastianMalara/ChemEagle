@@ -25,6 +25,13 @@ import copy
 from typing import Optional
 import time
 from llm_wrapper import LLMWrapper
+from runtime_guards import (
+    RuntimeStageError,
+    assistant_message as guarded_assistant_message,
+    message_content,
+    safe_json_loads,
+    tool_calls_or_empty,
+)
 from runtime_device import resolve_torch_device
 
 def _debug_enabled() -> bool:
@@ -283,7 +290,18 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls
+    assistant_message = guarded_assistant_message(
+        response,
+        context="molecular_agent.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="molecular_agent.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="molecular_agent.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -332,7 +350,7 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -347,7 +365,18 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
 
     
     # 获取 GPT 生成的结果
-    gpt_output = [json.loads(response.choices[0].message.content)]
+    gpt_output = [
+        safe_json_loads(
+            message_content(
+                response,
+                context="molecular_agent.final_response",
+                required=True,
+                retry_trigger="auto_recovery_retry",
+            ),
+            context="molecular_agent.final_response",
+            retry_trigger="auto_recovery_retry",
+        )
+    ]
 
 
     def get_multi_molecular(image_path: str) -> list:
@@ -530,7 +559,18 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls
+    assistant_message = guarded_assistant_message(
+        response,
+        context="molecular_agent_correctR.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="molecular_agent_correctR.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="molecular_agent_correctR.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -579,7 +619,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -594,7 +634,18 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
 
     
     # 获取 GPT 生成的结果
-    gpt_output = [json.loads(response.choices[0].message.content)]
+    gpt_output = [
+        safe_json_loads(
+            message_content(
+                response,
+                context="molecular_agent_correctR.final_response",
+                required=True,
+                retry_trigger="auto_recovery_retry",
+            ),
+            context="molecular_agent_correctR.final_response",
+            retry_trigger="auto_recovery_retry",
+        )
+    ]
     _debug_print(f"gpt_output_mol:{gpt_output}")
 
 
@@ -773,7 +824,18 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls
+    assistant_message = guarded_assistant_message(
+        response,
+        context="molecular_agent_correctmultiR.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="molecular_agent_correctmultiR.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="molecular_agent_correctmultiR.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -822,7 +884,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -837,7 +899,18 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
 
     
     # 获取 GPT 生成的结果
-    gpt_output = [json.loads(response.choices[0].message.content)]
+    gpt_output = [
+        safe_json_loads(
+            message_content(
+                response,
+                context="molecular_agent_correctmultiR.final_response",
+                required=True,
+                retry_trigger="auto_recovery_retry",
+            ),
+            context="molecular_agent_correctmultiR.final_response",
+            retry_trigger="auto_recovery_retry",
+        )
+    ]
     _debug_print(f"gpt_output_mol:{gpt_output}")
 
 
@@ -1052,7 +1125,18 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls or []
+    assistant_message = guarded_assistant_message(
+        response,
+        context="molecular_agent_os.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="molecular_agent_os.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="molecular_agent_os.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -1100,7 +1184,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -1119,7 +1203,12 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
     # 获取 GPT 生成的结果（支持从包含思考过程的文本中提取）
     from get_R_group_sub_agent import extract_json_from_text_with_reasoning
     
-    raw_content = response.choices[0].message.content
+    raw_content = message_content(
+        response,
+        context="molecular_agent_os.final_response",
+        required=True,
+        retry_trigger="auto_recovery_retry",
+    )
     
     try:
         # 首先尝试直接解析
