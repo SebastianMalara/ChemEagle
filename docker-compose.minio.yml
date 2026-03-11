@@ -1,0 +1,31 @@
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-02-18T16-25-55Z
+    command: server /data --console-address ":9001"
+    env_file:
+      - .env.minio.example
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-02-15T10-36-16Z
+    depends_on:
+      - minio
+    env_file:
+      - .env.minio.example
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set local $$MINIO_ENDPOINT $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do
+        echo 'waiting for minio...';
+        sleep 2;
+      done;
+      /usr/bin/mc mb --ignore-existing local/$$ARTIFACT_S3_BUCKET;
+      /usr/bin/mc anonymous set download local/$$ARTIFACT_S3_BUCKET || true;
+      exit 0;
+      "
+
+volumes:
+  minio-data:

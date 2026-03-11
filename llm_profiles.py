@@ -197,6 +197,8 @@ def list_available_models(profile: LLMProfile, *, limit: int = 500) -> ModelCata
         kwargs = {"api_key": profile.api_key or "EMPTY"}
         if profile.base_url:
             kwargs["base_url"] = profile.base_url
+        elif provider == "openai":
+            kwargs["base_url"] = "https://api.openai.com/v1"
         client = OpenAI(**kwargs)
         model_list = client.models.list()
         models = []

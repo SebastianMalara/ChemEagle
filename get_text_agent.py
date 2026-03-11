@@ -17,6 +17,7 @@ from openai import OpenAI
 
 from asset_registry import AssetNotAvailableError, ensure_asset_available
 from llm_wrapper import LLMWrapper
+from review_tracking import llm_phase
 from runtime_device import (
     easyocr_uses_acceleration,
     resolve_ocr_backend,
@@ -230,7 +231,8 @@ def _ocr_text_via_llm_vision(image_path: str) -> str:
             ],
         },
     ]
-    return llm.chat_completion_text(messages, model=model_name, temperature=0)
+    with llm_phase("ocr_vision"):
+        return llm.chat_completion_text(messages, model=model_name, temperature=0)
 
 
 def _extract_image_text(image_path: str) -> tuple[str, str]:
@@ -332,12 +334,13 @@ def _repair_json_via_model(client, model_name: str, raw_content: str, max_attemp
                 ),
             },
         ]
-        response = _chat_completion_with_json_fallback(
-            client,
-            model=model_name,
-            messages=repair_messages,
-            response_format={"type": "json_object"},
-        )
+        with llm_phase("json_repair"):
+            response = _chat_completion_with_json_fallback(
+                client,
+                model=model_name,
+                messages=repair_messages,
+                response_format={"type": "json_object"},
+            )
         candidate = response.choices[0].message.content or ""
         parsed = _extract_json_from_text(candidate)
         if parsed is not None:

@@ -19,6 +19,7 @@ ENV/
 .env.*
 !.env.example
 !.env.sample
+!.env.minio.example
 
 .DS_Store
 
@@ -32,3 +33,4 @@ rxn.ckpt
 
 models/
 assets/
+data/

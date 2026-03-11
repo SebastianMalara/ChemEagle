@@ -13,6 +13,7 @@ from rxnim import RxnIM
 import json
 import base64
 import re
+import traceback
 from typing import Optional
 from asset_registry import build_asset_preflight_report
 from get_molecular_agent import process_reaction_image_with_multiple_products_and_text_correctR, process_reaction_image_with_multiple_products_and_text_correctmultiR
@@ -21,6 +22,7 @@ from get_R_group_sub_agent import process_reaction_image_with_table_R_group, pro
 from get_observer import action_observer_agent, plan_observer_agent,action_observer_agent_OS, plan_observer_agent_OS
 from get_text_agent import text_extraction_agent, text_extraction_agent_OS
 from llm_wrapper import LLMWrapper
+from review_tracking import llm_phase
 
 
 def _normalize_tool_args(raw_args: Optional[dict], image_path: str) -> dict:
@@ -43,6 +45,9 @@ TOOL_NAME_ALIASES = {
     "reactiontemplateparsingagent": "get_full_reaction_template",
     "molecular_recognition_agent": "get_multi_molecular_full",
     "molecularrecognitionagent": "get_multi_molecular_full",
+    "get_other_molecules": "get_multi_molecular_full",
+    "other_molecules": "get_multi_molecular_full",
+    "other_molecules_agent": "get_multi_molecular_full",
     "text_extraction_agent": "text_extraction_agent",
     "textextractionagent": "text_extraction_agent",
 }
@@ -101,6 +106,27 @@ def _tool_unavailable_payload(tool_name: str, tool_args: dict, exc: Exception) -
         "tool_name": tool_name,
         "arguments": tool_args,
         "warning": str(exc),
+    }
+
+
+def _partial_payload_enabled() -> bool:
+    return os.getenv("CHEMEAGLE_ALLOW_PARTIAL_PAYLOAD", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _partial_failure_payload(
+    *,
+    exc: Exception,
+    image_path: str,
+    plan_to_execute: Optional[list],
+    execution_logs: list,
+) -> dict:
+    return {
+        "partial": True,
+        "error": str(exc),
+        "traceback": traceback.format_exc(),
+        "image_path": image_path,
+        "plan": plan_to_execute or [],
+        "execution_logs": execution_logs,
     }
 
 
@@ -223,19 +249,20 @@ def ChemEagle(
         planner_user_message = prompt_file.read()
 
     # Step 1: 调用 planner 获取 agent 列表
-    planner_output = llm.chat_completion_text(
-        model=os.getenv("LLM_MODEL", "gpt-5-mini"),
-        messages=[
-            {'role': 'system', 'content': "You are a chemical image understanding and extraction planning expert.After checking the image, your ONLY task is to SELECT and CALL the most appropriate agents from the list below to best fit the data extraction of the image."},
-            {
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': planner_user_message},
-                    {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{base64_image}'}}
-                ]
-            }
-        ]
-    )
+    with llm_phase("planner"):
+        planner_output = llm.chat_completion_text(
+            model=os.getenv("LLM_MODEL", "gpt-5-mini"),
+            messages=[
+                {'role': 'system', 'content': "You are a chemical image understanding and extraction planning expert.After checking the image, your ONLY task is to SELECT and CALL the most appropriate agents from the list below to best fit the data extraction of the image."},
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': planner_user_message},
+                        {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{base64_image}'}}
+                    ]
+                }
+            ]
+        )
 
     # 解析 planner 返回的 agent 列表
     _debug_print(f"[D] Planner output: {planner_output}")
@@ -320,104 +347,99 @@ def ChemEagle(
     _debug_print(f"[D] plan_to_execute:{plan_to_execute}")
     execution_logs = []
     results = []
+    try:
+        # Step 5: 执行工具调用
+        for idx, plan_item in enumerate(plan_to_execute):
+            raw_tool_name = plan_item.get("name") or plan_item.get("tool_name")
+            tool_name = _resolve_supported_tool_name(raw_tool_name, TOOL_MAP)
+            if not tool_name:
+                print(f"warning: plan_item {idx} has unsupported tool, skip: {plan_item}")
+                continue
+            
+            tool_call_id = plan_item.get("id") or f"observer_call_{idx}"
+            tool_args = _normalize_tool_args(plan_item.get("arguments", {}), image_path)
 
-    # Step 5: 执行工具调用
-    for idx, plan_item in enumerate(plan_to_execute):
-        raw_tool_name = plan_item.get("name") or plan_item.get("tool_name")
-        tool_name = _resolve_supported_tool_name(raw_tool_name, TOOL_MAP)
-        if not tool_name:
-            print(f"warning: plan_item {idx} has unsupported tool, skip: {plan_item}")
-            continue
+            if tool_name not in TOOL_MAP:
+                raise ValueError(f"Unknown tool called: {tool_name}")
+            tool_func = TOOL_MAP[tool_name]
+            try:
+                tool_result = tool_func(**tool_args)
+            except Exception as exc:
+                if tool_name == "text_extraction_agent":
+                    tool_result = _tool_unavailable_payload(tool_name, tool_args, exc)
+                    tool_result["asset_preflight"] = tool_preflight
+                else:
+                    raise
+
+            execution_logs.append({
+                "id": tool_call_id,
+                "name": tool_name,
+                "arguments": tool_args,
+                "result": tool_result,
+            })
+
+            results.append({
+                'role': 'assistant',
+                'content': json.dumps({
+                    'tool_call_id': tool_call_id,
+                    'tool_name': tool_name,
+                    'image_path': image_path,
+                    'tool_result': tool_result,
+                }),
+            })
+
+        if use_action_observer and action_observer_agent(image_path, execution_logs):
+            return {
+                "redo": True,
+                "plan": plan_to_execute,
+                "execution_logs": execution_logs,
+            }
+
+        executed_tools = [selected_tool]
+        if has_text_extraction:
+            executed_tools.append("text_extraction_agent")
+        assistant_message = {
+            "role": "assistant",
+            "content": f"Selected agents: {', '.join(agent_list)}\nExecuted tools: {', '.join(executed_tools)}"
+        }
         
-        tool_call_id = plan_item.get("id") or f"observer_call_{idx}"
-        tool_args = _normalize_tool_args(plan_item.get("arguments", {}), image_path)
-
-        if tool_name not in TOOL_MAP:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        tool_func = TOOL_MAP[tool_name]
-        try:
-            tool_result = tool_func(**tool_args)
-        except Exception as exc:
-            if tool_name == "text_extraction_agent":
-                tool_result = _tool_unavailable_payload(tool_name, tool_args, exc)
-                tool_result["asset_preflight"] = tool_preflight
-            else:
-                raise
-
-        execution_logs.append({
-            "id": tool_call_id,
-            "name": tool_name,
-            "arguments": tool_args,
-            "result": tool_result,
-        })
-
-        # 保存每个工具调用结果
-        # NOTE: We execute tools locally (without model-emitted tool_calls), so
-        # these must not be sent with role="tool" to OpenAI chat completions.
-        # Instead, inject structured tool outputs as assistant context.
-        results.append({
-            'role': 'assistant',
-            'content': json.dumps({
-                'tool_call_id': tool_call_id,
-                'tool_name': tool_name,
-                'image_path': image_path,
-                'tool_result': tool_result,
-            }),
-        })
-
-    # Action Observer: 检查执行结果，如果失败则重新执行
-    if use_action_observer and action_observer_agent(image_path, execution_logs):
-        return {
-            "redo": True,
-            "plan": plan_to_execute,
-            "execution_logs": execution_logs,
+        completion_payload = {
+            'model': os.getenv("LLM_MODEL", "gpt-5-mini"),
+            'messages': [
+                {'role': 'system', 'content': 'You are a helpful assistant.'},
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': prompt},
+                        {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{base64_image}'}},
+                    ]
+                },
+                assistant_message,
+                *results
+                ],
         }
 
-    # Prepare the chat completion payload
-    # 构建 assistant 消息，包含 planner 的输出和工具调用信息
-    executed_tools = [selected_tool]
-    if has_text_extraction:
-        executed_tools.append("text_extraction_agent")
-    assistant_message = {
-        "role": "assistant",
-        "content": f"Selected agents: {', '.join(agent_list)}\nExecuted tools: {', '.join(executed_tools)}"
-    }
-    
-    completion_payload = {
-        'model': os.getenv("LLM_MODEL", "gpt-5-mini"),
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'text',
-                        'text': prompt
-                    },
-                    {
-                        'type': 'image_url',
-                        'image_url': {
-                            'url': f'data:image/png;base64,{base64_image}'
-                        }
-                    }
-                ]
-            },
-            assistant_message,
-            *results
-            ],
-    }
+        with llm_phase("final_synthesis"):
+            response_text = llm.chat_completion_text(
+                model=completion_payload["model"],
+                messages=completion_payload["messages"],
+                response_format={ 'type': 'json_object' },
+            )
 
-    # Generate new response
-    response_text = llm.chat_completion_text(
-        model=completion_payload["model"],
-        messages=completion_payload["messages"],
-        response_format={ 'type': 'json_object' },
-    )
-
-    # 获取 GPT 生成的结果
-    gpt_output = json.loads(response_text)
-    print(gpt_output)
-    return gpt_output
+        gpt_output = json.loads(response_text)
+        print(gpt_output)
+        return gpt_output
+    except Exception as exc:
+        if _partial_payload_enabled() and (plan_to_execute or execution_logs):
+            partial = _partial_failure_payload(
+                exc=exc,
+                image_path=image_path,
+                plan_to_execute=plan_to_execute,
+                execution_logs=execution_logs,
+            )
+            print(partial)
+            return partial
+        raise
 
 def ChemEagle_OS(
     image_path: str,
@@ -549,121 +571,119 @@ def ChemEagle_OS(
     _debug_print(f"[OS_D] plan_to_execute:{plan_to_execute}")
     execution_logs = []
     results = []
-
-    # Step 4: 执行工具调用
-    for idx, plan_item in enumerate(plan_to_execute):
-        raw_tool_name = plan_item.get("name") or plan_item.get("tool_name")
-        tool_name = _resolve_supported_tool_name(raw_tool_name, TOOL_MAP)
-        if not tool_name:
-            print(f"warning: plan_item {idx} has unsupported tool, skip: {plan_item}")
-            continue
-        
-        tool_call_id = plan_item.get("id") or f"observer_call_{idx}"
-        tool_args = _normalize_tool_args(plan_item.get("arguments", {}), image_path)
-
-        if tool_name not in TOOL_MAP:
-            raise ValueError(f"Unknown tool called: {tool_name}")
-        tool_func = TOOL_MAP[tool_name]
-        try:
-            tool_result = tool_func(**tool_args)
-        except Exception as exc:
-            if tool_name == "text_extraction_agent":
-                tool_result = _tool_unavailable_payload(tool_name, tool_args, exc)
-                tool_result["asset_preflight"] = tool_preflight
-            else:
-                raise
-
-        execution_logs.append({
-            "id": tool_call_id,
-            "name": tool_name,
-            "arguments": tool_args,
-            "result": tool_result,
-        })
-
-        # 确保 tool_name 不为空（OpenAI 兼容 API 标准要求）
-        if not tool_name or not tool_name.strip():
-            print(f"warning: tool_name is empty，skip")
-            continue
+    try:
+        for idx, plan_item in enumerate(plan_to_execute):
+            raw_tool_name = plan_item.get("name") or plan_item.get("tool_name")
+            tool_name = _resolve_supported_tool_name(raw_tool_name, TOOL_MAP)
+            if not tool_name:
+                print(f"warning: plan_item {idx} has unsupported tool, skip: {plan_item}")
+                continue
             
-        results.append({
-            'role': 'assistant',
-            'content': json.dumps({
-                'tool_call_id': tool_call_id,
-                'tool_name': tool_name.strip(),
-                'image_path': image_path,
-                'tool_result': tool_result,
-            }),
-        })
-    
-    print(f'[OS_D] results: {results}')
-    
-    # Action Observer: 检查执行结果，如果失败则重新执行
-    if use_action_observer and action_observer_agent_OS(image_path, execution_logs):
-        return {
-            "redo": True,
-            "plan": plan_to_execute,
-            "execution_logs": execution_logs,
+            tool_call_id = plan_item.get("id") or f"observer_call_{idx}"
+            tool_args = _normalize_tool_args(plan_item.get("arguments", {}), image_path)
+
+            if tool_name not in TOOL_MAP:
+                raise ValueError(f"Unknown tool called: {tool_name}")
+            tool_func = TOOL_MAP[tool_name]
+            try:
+                tool_result = tool_func(**tool_args)
+            except Exception as exc:
+                if tool_name == "text_extraction_agent":
+                    tool_result = _tool_unavailable_payload(tool_name, tool_args, exc)
+                    tool_result["asset_preflight"] = tool_preflight
+                else:
+                    raise
+
+            execution_logs.append({
+                "id": tool_call_id,
+                "name": tool_name,
+                "arguments": tool_args,
+                "result": tool_result,
+            })
+
+            if not tool_name or not tool_name.strip():
+                print("warning: tool_name is empty, skip")
+                continue
+                
+            results.append({
+                'role': 'assistant',
+                'content': json.dumps({
+                    'tool_call_id': tool_call_id,
+                    'tool_name': tool_name.strip(),
+                    'image_path': image_path,
+                    'tool_result': tool_result,
+                }),
+            })
+        
+        print(f'[OS_D] results: {results}')
+        
+        if use_action_observer and action_observer_agent_OS(image_path, execution_logs):
+            return {
+                "redo": True,
+                "plan": plan_to_execute,
+                "execution_logs": execution_logs,
+            }
+
+        executed_tools = [selected_tool]
+        if has_text_extraction:
+            executed_tools.append("text_extraction_agent")
+        assistant_message = {
+            "role": "assistant",
+            "content": f"Selected agents: {', '.join(agent_list)}\nExecuted tools: {', '.join(executed_tools)}"
+        }
+        
+        completion_payload = {
+            'model': model_name,
+            'messages': [
+                {'role': 'system', 'content': 'You are a helpful assistant.'},
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text', 'text': prompt},
+                        {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{base64_image}' }}
+                    ],
+                },
+                assistant_message,
+                *results
+                ],
         }
 
-    # Prepare the chat completion payload
-    # 构建 assistant 消息，包含 planner 的输出和工具调用信息
-    executed_tools = [selected_tool]
-    if has_text_extraction:
-        executed_tools.append("text_extraction_agent")
-    assistant_message = {
-        "role": "assistant",
-        "content": f"Selected agents: {', '.join(agent_list)}\nExecuted tools: {', '.join(executed_tools)}"
-    }
-    
-    completion_payload = {
-        'model': model_name,
-        'messages': [
-            {'role': 'system', 'content': 'You are a helpful assistant.'},
-            {
-                'role': 'user',
-                'content': [
-                    {'type': 'text', 'text': prompt},
-                    {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{base64_image}' }}
-                ],
-            },
-            assistant_message,
-            *results
-            ],
-    }
-
-    response = client.chat.completions.create(
-        model=completion_payload["model"],
-        messages=completion_payload["messages"],
-        #response_format={ 'type': 'json_object' },
-            )
-    print(response)
-    
-    # 获取原始响应内容
-    raw_content = response.choices[0].message.content
-    
-    # 尝试解析 JSON（支持从包含思考过程的文本中提取）
-    from get_R_group_sub_agent import extract_json_from_text_with_reasoning
-    
-    try:
-        # 首先尝试直接解析
-        gpt_output = json.loads(raw_content)
-        print("DEBUG [OS_D]: Successfully parsed JSON directly")
-    except json.JSONDecodeError:
-        # 如果直接解析失败，使用智能提取函数（支持思考模型输出）
-        print("WARNING [OS_D]: Direct JSON parsing failed, trying to extract JSON from text...")
-        gpt_output = extract_json_from_text_with_reasoning(raw_content)
+        response = client.chat.completions.create(
+            model=completion_payload["model"],
+            messages=completion_payload["messages"],
+        )
+        print(response)
+        raw_content = response.choices[0].message.content
+        from get_R_group_sub_agent import extract_json_from_text_with_reasoning
         
-        if gpt_output is not None:
-            print("DEBUG [OS_D]: Successfully extracted JSON from text (with reasoning support)")
-        else:
-            print(f"ERROR [OS_D]: Failed to parse JSON from model response")
-            print(f"Raw content (last 2000 chars):\n{raw_content[-2000:]}")
-            # 如果无法解析为 JSON，返回原始内容（保持向后兼容）
-            print("WARNING [OS_D]: Returning raw content as fallback")
-            return {"content": raw_content, "parsed": False}
-    
-    print(gpt_output)
-    return gpt_output
+        try:
+            gpt_output = json.loads(raw_content)
+            print("DEBUG [OS_D]: Successfully parsed JSON directly")
+        except json.JSONDecodeError:
+            print("WARNING [OS_D]: Direct JSON parsing failed, trying to extract JSON from text...")
+            gpt_output = extract_json_from_text_with_reasoning(raw_content)
+            
+            if gpt_output is not None:
+                print("DEBUG [OS_D]: Successfully extracted JSON from text (with reasoning support)")
+            else:
+                print("ERROR [OS_D]: Failed to parse JSON from model response")
+                print(f"Raw content (last 2000 chars):\n{raw_content[-2000:]}")
+                print("WARNING [OS_D]: Returning raw content as fallback")
+                return {"content": raw_content, "parsed": False}
+        
+        print(gpt_output)
+        return gpt_output
+    except Exception as exc:
+        if _partial_payload_enabled() and (plan_to_execute or execution_logs):
+            partial = _partial_failure_payload(
+                exc=exc,
+                image_path=image_path,
+                plan_to_execute=plan_to_execute,
+                execution_logs=execution_logs,
+            )
+            print(partial)
+            return partial
+        raise
 
 
 
