@@ -415,28 +415,57 @@ def _create_openai_probe_completion(*, client: Any, model: str, messages: List[D
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "max_completion_tokens": 5,
     }
     try:
         return client.chat.completions.create(**kwargs)
     except BadRequestError as exc:
+        if not _should_retry_openai_probe_with_completion_budget(exc):
+            raise
+        return _retry_openai_probe_with_completion_budget(client=client, kwargs=kwargs)
+    except Exception as exc:
+        if not _looks_like_probe_completion_budget_error(exc):
+            raise
+        return _retry_openai_probe_with_completion_budget(client=client, kwargs=kwargs)
+
+
+def _retry_openai_probe_with_completion_budget(*, client: Any, kwargs: Dict[str, Any]) -> Any:
+    probe_budget = max(16, int(os.getenv("LLM_PREFLIGHT_OPENAI_MAX_TOKENS", "64")))
+    completion_kwargs = dict(kwargs)
+    completion_kwargs["max_completion_tokens"] = probe_budget
+    try:
+        return client.chat.completions.create(**completion_kwargs)
+    except BadRequestError as exc:
         if not _is_max_completion_tokens_error(exc):
             raise
-        fallback_kwargs = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": 5,
-        }
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs["max_tokens"] = probe_budget
         return client.chat.completions.create(**fallback_kwargs)
     except Exception as exc:
         if not _looks_like_max_completion_tokens_error(exc):
             raise
-        fallback_kwargs = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": 5,
-        }
+        fallback_kwargs = dict(kwargs)
+        fallback_kwargs["max_tokens"] = probe_budget
         return client.chat.completions.create(**fallback_kwargs)
+
+
+def _should_retry_openai_probe_with_completion_budget(exc: BadRequestError) -> bool:
+    body = getattr(exc, "body", {}) or {}
+    error = body.get("error", {}) if isinstance(body, dict) else {}
+    param = str(error.get("param") or "").strip().lower()
+    code = str(error.get("code") or "").strip().lower()
+    message = str(error.get("message") or exc).lower()
+    if param in {"max_tokens", "max_completion_tokens"}:
+        return True
+    if code == "unsupported_parameter" and "max_completion_tokens" in message:
+        return False
+    if "output limit" in message and "max_tokens" in message:
+        return True
+    return "higher max_tokens" in message or ("max tokens" in message and "required" in message)
+
+
+def _looks_like_probe_completion_budget_error(exc: Exception) -> bool:
+    lowered = str(exc).lower()
+    return "higher max_tokens" in lowered or ("output limit" in lowered and "max_tokens" in lowered)
 
 
 def _is_max_completion_tokens_error(exc: BadRequestError) -> bool:

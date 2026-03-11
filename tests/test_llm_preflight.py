@@ -80,6 +80,11 @@ class LlmPreflightTests(unittest.TestCase):
 
             def create(self, **kwargs):
                 self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    raise RuntimeError(
+                        "Could not finish the message because max_tokens or model output limit was reached. "
+                        "Please try again with higher max_tokens."
+                    )
                 if "max_completion_tokens" in kwargs:
                     raise RuntimeError("Unsupported parameter: max_completion_tokens")
                 return {"ok": True}
@@ -92,9 +97,32 @@ class LlmPreflightTests(unittest.TestCase):
             messages=[{"role": "user", "content": "Reply with OK."}],
         )
         self.assertEqual(result, {"ok": True})
-        self.assertEqual(len(fake_client.chat.completions.calls), 2)
-        self.assertIn("max_completion_tokens", fake_client.chat.completions.calls[0])
-        self.assertIn("max_tokens", fake_client.chat.completions.calls[1])
+        self.assertEqual(len(fake_client.chat.completions.calls), 3)
+        self.assertNotIn("max_completion_tokens", fake_client.chat.completions.calls[0])
+        self.assertNotIn("max_tokens", fake_client.chat.completions.calls[0])
+        self.assertIn("max_completion_tokens", fake_client.chat.completions.calls[1])
+        self.assertIn("max_tokens", fake_client.chat.completions.calls[2])
+
+    def test_openai_probe_uses_unbounded_request_when_provider_accepts_it(self) -> None:
+        class FakeChatCompletions:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def create(self, **kwargs):
+                self.calls.append(kwargs)
+                return {"ok": True}
+
+        fake_client = mock.Mock()
+        fake_client.chat.completions = FakeChatCompletions()
+        result = _create_openai_probe_completion(
+            client=fake_client,
+            model="test-model",
+            messages=[{"role": "user", "content": "Reply with OK."}],
+        )
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(fake_client.chat.completions.calls), 1)
+        self.assertNotIn("max_completion_tokens", fake_client.chat.completions.calls[0])
+        self.assertNotIn("max_tokens", fake_client.chat.completions.calls[0])
 
 
 if __name__ == "__main__":
