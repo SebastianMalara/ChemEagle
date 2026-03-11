@@ -28,6 +28,15 @@ import re
 import time
 from asset_registry import ensure_asset_available
 from llm_wrapper import LLMWrapper
+from runtime_guards import (
+    RuntimeStageError,
+    assistant_message as guarded_assistant_message,
+    first_dict_item,
+    first_tool_call,
+    message_content,
+    safe_json_loads,
+    tool_calls_or_empty,
+)
 from runtime_device import resolve_torch_device
 
 _RUNTIME_DEVICE_TYPE: Optional[str] = None
@@ -260,7 +269,7 @@ def draw_mol_bboxes(image_path, coref_results, output_path=None):
     # Handle the structure of coref_results
     # It is a list of dicts. We assume the first dict corresponds to the image if it's a list.
     if isinstance(coref_results, list) and len(coref_results) > 0:
-        data = coref_results[0]
+        data = first_dict_item(coref_results, context="r_group_agent.draw_mol_bboxes", retry_trigger="auto_recovery_retry")
     elif isinstance(coref_results, dict):
         data = coref_results
     else:
@@ -576,7 +585,9 @@ def get_multi_molecular_text_to_correct(image_path: str) -> list:
                 bbox.pop(key, None)
 
     # 假设 parse_coref_data_with_fallback 需要传入单个 dict
-    parsed = parse_coref_data_with_fallback(coref_results[0])
+    parsed = parse_coref_data_with_fallback(
+        first_dict_item(coref_results, context="r_group_agent.get_multi_molecular_text_to_correct", retry_trigger="auto_recovery_retry")
+    )
     print(f"[get_multi_molecular_text_to_correct] parsed: {json.dumps(parsed)}")
     return parsed
 
@@ -620,7 +631,9 @@ def get_multi_molecular_text_to_correct_OS(image_path: str) -> list:
                 bbox.pop(key, None)
 
     # 假设 parse_coref_data_with_fallback 需要传入单个 dict
-    parsed = parse_coref_data_with_fallback(coref_results[0])
+    parsed = parse_coref_data_with_fallback(
+        first_dict_item(coref_results, context="r_group_agent.get_multi_molecular_text_to_correct_os", retry_trigger="auto_recovery_retry")
+    )
     print(f"[get_multi_molecular_text_to_correct] parsed: {json.dumps(parsed)}")
     return parsed
 
@@ -640,7 +653,7 @@ def get_multi_molecular_full(image_path: str) -> list:
             for key in ["category", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs',"coords","edges"]: #'atoms'
                 bbox.pop(key, None)  # 安全地移除键
 
-    data = coref_results[0]
+    data = first_dict_item(coref_results, context="r_group_agent.get_multi_molecular_full", retry_trigger="auto_recovery_retry")
     parsed = parse_coref_data_with_fallback(data)
 
     
@@ -699,7 +712,11 @@ def get_reaction(image_path: str) -> dict:
     Returns a structured dictionary of reactions extracted from the image,
     """
     # 复用缓存的 raw_results
-    raw_pred = get_cached_raw_results(image_path)[0]
+    raw_pred = first_dict_item(
+        get_cached_raw_results(image_path),
+        context="r_group_agent.get_reaction",
+        retry_trigger="auto_recovery_retry",
+    )
     return get_reaction_from_raw(raw_pred)
 
 ############################### Rxn_OS
@@ -722,7 +739,11 @@ def get_reaction_OS(image_path: str) -> dict:
     Returns a structured dictionary of reactions extracted from the image,
     """
     # 复用缓存的 raw_results
-    raw_pred = get_cached_raw_results_OS(image_path)[0]
+    raw_pred = first_dict_item(
+        get_cached_raw_results_OS(image_path),
+        context="r_group_agent.get_reaction_os",
+        retry_trigger="auto_recovery_retry",
+    )
     return get_reaction_from_raw(raw_pred)
 
 
@@ -869,7 +890,7 @@ def get_full_reaction_template(image_path: str) -> dict:
             for key in ["category", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs',"coords","edges"]: #'atoms'
                 bbox.pop(key, None)  # 安全地移除键
 
-    data = coref_results[0]
+    data = first_dict_item(coref_results, context="r_group_agent.get_full_reaction_template", retry_trigger="auto_recovery_retry")
     parsed = parse_coref_data_with_fallback(data)
 
     combined_result = {
@@ -912,7 +933,7 @@ def get_full_reaction_template_OS(image_path: str) -> dict:
             for key in ["category", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs',"coords","edges"]: #'atoms'
                 bbox.pop(key, None)  # 安全地移除键
 
-    data = coref_results[0]
+    data = first_dict_item(coref_results, context="r_group_agent.get_full_reaction_template_os", retry_trigger="auto_recovery_retry")
     parsed = parse_coref_data_with_fallback(data)
 
     combined_result = {
@@ -1044,7 +1065,18 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls
+    assistant_message = guarded_assistant_message(
+        response,
+        context="r_group_agent.product_variant.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="r_group_agent.product_variant.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="r_group_agent.product_variant.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -1097,7 +1129,7 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -1112,7 +1144,16 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
 
     
     # 获取 GPT 生成的结果
-    gpt_output = json.loads(response.choices[0].message.content)
+    gpt_output = safe_json_loads(
+        message_content(
+            response,
+            context="r_group_agent.product_variant.final_response",
+            required=True,
+            retry_trigger="auto_recovery_retry",
+        ),
+        context="r_group_agent.product_variant.final_response",
+        retry_trigger="auto_recovery_retry",
+    )
     print("R_group_agent_output:", gpt_output)
     image = Image.open(image_path).convert('RGB')
     image_np = np.array(image)
@@ -1126,7 +1167,7 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
     # reaction_results = model.extract_reactions_from_figures([image_np])
     #reaction_results = get_reaction_withatoms_correctR(image_path)[0]
     raw_results  = get_cached_raw_results(image_path)
-    reaction_results = raw_results[0]
+    reaction_results = first_dict_item(raw_results, context="r_group_agent.product_variant.raw_results", retry_trigger="auto_recovery_retry")
     
     reaction = {
     "reactants": reaction_results.get('reactants', []),
@@ -1163,13 +1204,14 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
     reactants_array = []
     products = []
 
-    for reactant in reaction_results[0]['reactions'][0]['reactants']:
+    first_reaction = first_dict_item(reaction_results.get('reactions', []), context="r_group_agent.product_variant.reactions", retry_trigger="auto_recovery_retry")
+    for reactant in first_reaction.get('reactants', []):
         if 'smiles' in reactant:
             #print(f"SMILES:{reactant['smiles']}")
             ##print(reactant)
             reactants_array.append(reactant['smiles'])
 
-    for product in reaction_results[0]['reactions'][0]['products']:
+    for product in first_reaction.get('products', []):
         ##print(product['smiles'])
         ##print(product)
         products.append(product['smiles'])
@@ -1190,7 +1232,7 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
             for key in ["category", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs',"coords","edges"]: #'atoms'
                 bbox.pop(key, None)  # 安全地移除键
 
-    data = coref_results[0]
+    data = first_dict_item(coref_results, context="r_group_agent.process_variant.parse_coref", retry_trigger="auto_recovery_retry")
     parsed = parse_coref_data_with_fallback(data)
     
     toadd = {
@@ -1321,7 +1363,18 @@ def process_reaction_image_with_product_variant_R_group_OS(
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls or []
+    assistant_message = guarded_assistant_message(
+        response,
+        context="r_group_agent.product_variant_os.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="r_group_agent.product_variant_os.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="r_group_agent.product_variant_os.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -1369,7 +1422,7 @@ def process_reaction_image_with_product_variant_R_group_OS(
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -1386,7 +1439,12 @@ def process_reaction_image_with_product_variant_R_group_OS(
             )
 
     # 获取 GPT 生成的结果
-    raw_content = response.choices[0].message.content
+    raw_content = message_content(
+        response,
+        context="r_group_agent.product_variant_os.final_response",
+        required=True,
+        retry_trigger="auto_recovery_retry",
+    )
     
     # 检查内容是否为空
     if not raw_content or not raw_content.strip():
@@ -1425,7 +1483,7 @@ def process_reaction_image_with_product_variant_R_group_OS(
     # 使用 OS 版本的缓存函数
     coref_results = get_cached_multi_molecular_OS(image_path)
     raw_results = get_cached_raw_results_OS(image_path)
-    reaction_results = raw_results[0]
+    reaction_results = first_dict_item(raw_results, context="r_group_agent.product_variant_os.raw_results", retry_trigger="auto_recovery_retry")
     
     reaction = {
         "reactants": reaction_results.get('reactants', []),
@@ -1459,11 +1517,12 @@ def process_reaction_image_with_product_variant_R_group_OS(
     reactants_array = []
     products = []
 
-    for reactant in reaction_results[0]['reactions'][0]['reactants']:
+    first_reaction = first_dict_item(reaction_results.get('reactions', []), context="r_group_agent.product_variant_os.reactions", retry_trigger="auto_recovery_retry")
+    for reactant in first_reaction.get('reactants', []):
         if 'smiles' in reactant:
             reactants_array.append(reactant['smiles'])
 
-    for product in reaction_results[0]['reactions'][0]['products']:
+    for product in first_reaction.get('products', []):
         products.append(product['smiles'])
 
     # 整理反应数据
@@ -1479,7 +1538,7 @@ def process_reaction_image_with_product_variant_R_group_OS(
             for key in ["category", "molfile", "symbols", 'atoms', "bonds", 'category_id', 'score', 'corefs',"coords","edges"]:
                 bbox.pop(key, None)  # 安全地移除键
 
-    data = coref_results[0]
+    data = first_dict_item(coref_results, context="r_group_agent.process_variant_os.parse_coref", retry_trigger="auto_recovery_retry")
     parsed = parse_coref_data_with_fallback(data)
     
     toadd = {
@@ -1557,7 +1616,16 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
     )
 
     
-    tool_call = response.choices[0].message.tool_calls[0]
+    assistant_message = guarded_assistant_message(
+        response,
+        context="r_group_agent.table.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_call = first_tool_call(
+        assistant_message,
+        context="r_group_agent.table.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
     tool_name = tool_call.function.name  # 修改此处
     tool_arguments = tool_call.function.arguments  # 新增此处
     tool_call_id = tool_call.id
@@ -1603,7 +1671,7 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             function_call_result_message,
         ],
     }
@@ -1725,8 +1793,17 @@ def process_reaction_image_with_table_R_group(image_path: str) -> dict:
     else:
         raise TypeError(f"Unexpected tool_result type: {type(reaction_preds)}")
 
-    input1 = tool_result_json[0]
-    input2 = json.loads(response.choices[0].message.content) 
+    input1 = first_dict_item(tool_result_json, context="r_group_agent.table.tool_result_json", retry_trigger="auto_recovery_retry")
+    input2 = safe_json_loads(
+        message_content(
+            response,
+            context="r_group_agent.table.final_response",
+            required=True,
+            retry_trigger="auto_recovery_retry",
+        ),
+        context="r_group_agent.table.final_response",
+        retry_trigger="auto_recovery_retry",
+    )
     updated_input = replace_symbols_and_generate_smiles(input1, input2)
     print(f"txt_R_group_agent_output:{updated_input}")
     return updated_input
@@ -1821,11 +1898,24 @@ def process_reaction_image_with_table_R_group_OS(
         tool_choice="auto",
     )
 
-    tool_calls = response.choices[0].message.tool_calls or []
+    assistant_message = guarded_assistant_message(
+        response,
+        context="r_group_agent.table_os.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="r_group_agent.table_os.tool_selection")
     if not tool_calls:
-        raise ValueError("No tool calls returned from model")
-    
-    tool_call = tool_calls[0]
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="r_group_agent.table_os.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
+
+    tool_call = first_tool_call(
+        assistant_message,
+        context="r_group_agent.table_os.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
     tool_name = tool_call.function.name
     tool_arguments = tool_call.function.arguments
     tool_call_id = tool_call.id
@@ -1867,7 +1957,7 @@ def process_reaction_image_with_table_R_group_OS(
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             function_call_result_message,
         ],
     }
@@ -1883,8 +1973,14 @@ def process_reaction_image_with_table_R_group_OS(
         #response_format={'type': 'json_object'},
             )
     
-    print(f"DEBUG [OS]: Model response content type: {type(response.choices[0].message.content)}")
-    print(f"DEBUG [OS]: Model response content preview: {str(response.choices[0].message.content)[:500]}")
+    preview_content = message_content(
+        response,
+        context="r_group_agent.table_os.final_response",
+        required=True,
+        retry_trigger="auto_recovery_retry",
+    )
+    print(f"DEBUG [OS]: Model response content type: {type(preview_content)}")
+    print(f"DEBUG [OS]: Model response content preview: {str(preview_content)[:500]}")
 
     def replace_symbols_and_generate_smiles(input1, input2):
         """
@@ -1995,10 +2091,10 @@ def process_reaction_image_with_table_R_group_OS(
     else:
         raise TypeError(f"Unexpected tool_result type: {type(reaction_preds)}")
 
-    input1 = tool_result_json[0]
+    input1 = first_dict_item(tool_result_json, context="r_group_agent.table_os.tool_result_json", retry_trigger="auto_recovery_retry")
     
     # 获取模型返回的原始内容
-    raw_content = response.choices[0].message.content
+    raw_content = preview_content
     
     # 检查内容是否为空
     if not raw_content or not raw_content.strip():

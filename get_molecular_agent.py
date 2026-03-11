@@ -25,6 +25,14 @@ import copy
 from typing import Optional
 import time
 from llm_wrapper import LLMWrapper
+from runtime_guards import (
+    RuntimeStageError,
+    attach_runtime_metadata,
+    assistant_message as guarded_assistant_message,
+    message_content,
+    safe_json_loads,
+    tool_calls_or_empty,
+)
 from runtime_device import resolve_torch_device
 
 def _debug_enabled() -> bool:
@@ -34,6 +42,97 @@ def _debug_enabled() -> bool:
 def _debug_print(message: str) -> None:
     if _debug_enabled():
         print(message)
+
+
+def apply_smiles_conversion_to_bboxes(input_data, conversion_function, *, context: str):
+    updated_data = copy.deepcopy(input_data)
+    if not isinstance(updated_data, list):
+        raise RuntimeStageError(
+            "tool result is not a list of bbox containers",
+            context=context,
+            retry_trigger="auto_recovery_retry",
+        )
+    converted_bbox_count = 0
+    skipped_bbox_count = 0
+    warnings: list[dict] = []
+
+    for item_index, item in enumerate(updated_data or []):
+        bboxes = item.get("bboxes", []) if isinstance(item, dict) else []
+        for bbox_index, bbox in enumerate(bboxes):
+            if not isinstance(bbox, dict):
+                skipped_bbox_count += 1
+                warnings.append(
+                    {
+                        "item_index": item_index,
+                        "bbox_index": bbox_index,
+                        "reason": "bbox is not a dictionary",
+                    }
+                )
+                continue
+            missing_keys = [key for key in ("coords", "symbols", "edges") if key not in bbox]
+            if missing_keys:
+                skipped_bbox_count += 1
+                warnings.append(
+                    {
+                        "item_index": item_index,
+                        "bbox_index": bbox_index,
+                        "bbox": bbox.get("bbox"),
+                        "reason": f"missing keys: {', '.join(missing_keys)}",
+                    }
+                )
+                continue
+            try:
+                new_smiles, new_molfile, _ = conversion_function(
+                    bbox["coords"],
+                    bbox["symbols"],
+                    bbox["edges"],
+                )
+            except Exception as exc:
+                skipped_bbox_count += 1
+                warnings.append(
+                    {
+                        "item_index": item_index,
+                        "bbox_index": bbox_index,
+                        "bbox": bbox.get("bbox"),
+                        "reason": str(exc),
+                        "exception_class": exc.__class__.__name__,
+                    }
+                )
+                continue
+            bbox["smiles"] = new_smiles
+            bbox["molfile"] = new_molfile
+            converted_bbox_count += 1
+
+    conversion_summary = {
+        "context": context,
+        "converted_bbox_count": converted_bbox_count,
+        "skipped_bbox_count": skipped_bbox_count,
+        "warnings": warnings,
+    }
+    prefix = "warning" if skipped_bbox_count else "info"
+    print(
+        f"{prefix}: graph conversion summary for {context}: "
+        f"converted={converted_bbox_count} skipped={skipped_bbox_count}"
+    )
+    if converted_bbox_count == 0:
+        exc = RuntimeStageError(
+            f"all candidate bboxes failed graph conversion (skipped={skipped_bbox_count})",
+            context=context,
+            retry_trigger="auto_recovery_retry",
+        )
+        attach_runtime_metadata(
+            exc,
+            _partial_result={
+                "partial": True,
+                "conversion_summary": conversion_summary,
+                "tool_warnings": warnings,
+                "results": updated_data,
+            },
+            _conversion_summary=conversion_summary,
+            _tool_warnings=warnings,
+        )
+        raise exc
+    return updated_data, conversion_summary
 
 
 def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
@@ -283,7 +382,18 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls
+    assistant_message = guarded_assistant_message(
+        response,
+        context="molecular_agent.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="molecular_agent.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="molecular_agent.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -332,7 +442,7 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -347,7 +457,18 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
 
     
     # 获取 GPT 生成的结果
-    gpt_output = [json.loads(response.choices[0].message.content)]
+    gpt_output = [
+        safe_json_loads(
+            message_content(
+                response,
+                context="molecular_agent.final_response",
+                required=True,
+                retry_trigger="auto_recovery_retry",
+            ),
+            context="molecular_agent.final_response",
+            retry_trigger="auto_recovery_retry",
+        )
+    ]
 
 
     def get_multi_molecular(image_path: str) -> list:
@@ -403,37 +524,11 @@ def process_reaction_image_with_multiple_products_and_text(image_path: str) -> d
 
 
 
-    def update_smiles_and_molfile(input_data, conversion_function):
-        """
-        使用更新后的 'symbols'、'coords' 和 'edges' 调用 `conversion_function` 生成新的 'smiles' 和 'molfile'，
-        并替换到原数据结构中。
-        
-        参数:
-        - input_data: 包含 bboxes 的嵌套数据结构
-        - conversion_function: 函数，接受 'coords', 'symbols', 'edges' 并返回 (new_smiles, new_molfile, _)
-        
-        返回:
-        - 更新后的数据结构
-        """
-        for item in input_data:
-            for bbox in item.get('bboxes', []):
-                # 检查必需的键是否存在
-                if all(key in bbox for key in ['coords', 'symbols', 'edges']):
-                    coords = bbox['coords']
-                    symbols = bbox['symbols']
-                    edges = bbox['edges']
-                    
-                    # 调用转换函数生成新的 'smiles' 和 'molfile'
-                    new_smiles, new_molfile, _ = conversion_function(coords, symbols, edges)
-                    #print(f"    Generated 'smiles': {new_smiles}")
-            
-                    # 替换旧的 'smiles' 和 'molfile'
-                    bbox['smiles'] = new_smiles
-                    bbox['molfile'] = new_molfile
-
-        return input_data
-
-    updated_data = update_smiles_and_molfile(input2_updated, _convert_graph_to_smiles)
+    updated_data, _ = apply_smiles_conversion_to_bboxes(
+        input2_updated,
+        _convert_graph_to_smiles,
+        context="molecular_agent.graph_conversion",
+    )
 
     return updated_data
 
@@ -530,7 +625,18 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls
+    assistant_message = guarded_assistant_message(
+        response,
+        context="molecular_agent_correctR.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="molecular_agent_correctR.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="molecular_agent_correctR.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -579,7 +685,7 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -594,7 +700,18 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
 
     
     # 获取 GPT 生成的结果
-    gpt_output = [json.loads(response.choices[0].message.content)]
+    gpt_output = [
+        safe_json_loads(
+            message_content(
+                response,
+                context="molecular_agent_correctR.final_response",
+                required=True,
+                retry_trigger="auto_recovery_retry",
+            ),
+            context="molecular_agent_correctR.final_response",
+            retry_trigger="auto_recovery_retry",
+        )
+    ]
     _debug_print(f"gpt_output_mol:{gpt_output}")
 
 
@@ -651,37 +768,11 @@ def process_reaction_image_with_multiple_products_and_text_correctR(image_path: 
 
 
 
-    def update_smiles_and_molfile(input_data, conversion_function):
-        """
-        使用更新后的 'symbols'、'coords' 和 'edges' 调用 `conversion_function` 生成新的 'smiles' 和 'molfile'，
-        并替换到原数据结构中。
-        
-        参数:
-        - input_data: 包含 bboxes 的嵌套数据结构
-        - conversion_function: 函数，接受 'coords', 'symbols', 'edges' 并返回 (new_smiles, new_molfile, _)
-        
-        返回:
-        - 更新后的数据结构
-        """
-        for item in input_data:
-            for bbox in item.get('bboxes', []):
-                # 检查必需的键是否存在
-                if all(key in bbox for key in ['coords', 'symbols', 'edges']):
-                    coords = bbox['coords']
-                    symbols = bbox['symbols']
-                    edges = bbox['edges']
-                    
-                    # 调用转换函数生成新的 'smiles' 和 'molfile'
-                    new_smiles, new_molfile, _ = conversion_function(coords, symbols, edges)
-                    #print(f"    Generated 'smiles': {new_smiles}")
-            
-                    # 替换旧的 'smiles' 和 'molfile'
-                    bbox['smiles'] = new_smiles
-                    bbox['molfile'] = new_molfile
-
-        return input_data
-
-    updated_data = update_smiles_and_molfile(input2_updated, _convert_graph_to_smiles)
+    updated_data, _ = apply_smiles_conversion_to_bboxes(
+        input2_updated,
+        _convert_graph_to_smiles,
+        context="molecular_agent_correctR.graph_conversion",
+    )
     _debug_print(f"mol_agent_output:{updated_data}")
 
     return updated_data
@@ -773,7 +864,18 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls
+    assistant_message = guarded_assistant_message(
+        response,
+        context="molecular_agent_correctmultiR.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="molecular_agent_correctmultiR.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="molecular_agent_correctmultiR.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -822,7 +924,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -837,7 +939,18 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
 
     
     # 获取 GPT 生成的结果
-    gpt_output = [json.loads(response.choices[0].message.content)]
+    gpt_output = [
+        safe_json_loads(
+            message_content(
+                response,
+                context="molecular_agent_correctmultiR.final_response",
+                required=True,
+                retry_trigger="auto_recovery_retry",
+            ),
+            context="molecular_agent_correctmultiR.final_response",
+            retry_trigger="auto_recovery_retry",
+        )
+    ]
     _debug_print(f"gpt_output_mol:{gpt_output}")
 
 
@@ -924,37 +1037,11 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR(image_p
 
     input2_updated = update_symbols_and_corefs(gpt_output, coref_results)
 
-    def update_smiles_and_molfile(input_data, conversion_function):
-        """
-        使用更新后的 'symbols'、'coords' 和 'edges' 调用 `conversion_function` 生成新的 'smiles' 和 'molfile'，
-        并替换到原数据结构中。
-        
-        参数:
-        - input_data: 包含 bboxes 的嵌套数据结构
-        - conversion_function: 函数，接受 'coords', 'symbols', 'edges' 并返回 (new_smiles, new_molfile, _)
-        
-        返回:
-        - 更新后的数据结构
-        """
-        for item in input_data:
-            for bbox in item.get('bboxes', []):
-                # 检查必需的键是否存在
-                if all(key in bbox for key in ['coords', 'symbols', 'edges']):
-                    coords = bbox['coords']
-                    symbols = bbox['symbols']
-                    edges = bbox['edges']
-                    
-                    # 调用转换函数生成新的 'smiles' 和 'molfile'
-                    new_smiles, new_molfile, _ = conversion_function(coords, symbols, edges)
-                    #print(f"    Generated 'smiles': {new_smiles}")
-            
-                    # 替换旧的 'smiles' 和 'molfile'
-                    bbox['smiles'] = new_smiles
-                    bbox['molfile'] = new_molfile
-
-        return input_data
-
-    updated_data = update_smiles_and_molfile(input2_updated, _convert_graph_to_smiles)
+    updated_data, _ = apply_smiles_conversion_to_bboxes(
+        input2_updated,
+        _convert_graph_to_smiles,
+        context="molecular_agent_correctmultiR.graph_conversion",
+    )
     _debug_print(f"mol_agent_output:{updated_data}")
 
     return updated_data
@@ -1052,7 +1139,18 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
     }
 
     # Step 2: 处理多个工具调用
-    tool_calls = response.choices[0].message.tool_calls or []
+    assistant_message = guarded_assistant_message(
+        response,
+        context="molecular_agent_os.tool_selection",
+        retry_trigger="auto_recovery_retry",
+    )
+    tool_calls = tool_calls_or_empty(assistant_message, context="molecular_agent_os.tool_selection")
+    if not tool_calls:
+        raise RuntimeStageError(
+            "assistant message has no tool calls",
+            context="molecular_agent_os.tool_selection",
+            retry_trigger="auto_recovery_retry",
+        )
     results = []
 
     # 遍历每个工具调用
@@ -1100,7 +1198,7 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
                     }
                 ]
             },
-            _normalize_chat_message(response.choices[0].message),
+            _normalize_chat_message(assistant_message),
             *results
             ],
     }
@@ -1119,7 +1217,12 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
     # 获取 GPT 生成的结果（支持从包含思考过程的文本中提取）
     from get_R_group_sub_agent import extract_json_from_text_with_reasoning
     
-    raw_content = response.choices[0].message.content
+    raw_content = message_content(
+        response,
+        context="molecular_agent_os.final_response",
+        required=True,
+        retry_trigger="auto_recovery_retry",
+    )
     
     try:
         # 首先尝试直接解析
@@ -1223,36 +1326,11 @@ def process_reaction_image_with_multiple_products_and_text_correctmultiR_OS(
 
     input2_updated = update_symbols_and_corefs(gpt_output, coref_results)
 
-    def update_smiles_and_molfile(input_data, conversion_function):
-        """
-        使用更新后的 'symbols'、'coords' 和 'edges' 调用 `conversion_function` 生成新的 'smiles' 和 'molfile'，
-        并替换到原数据结构中。
-        
-        参数:
-        - input_data: 包含 bboxes 的嵌套数据结构
-        - conversion_function: 函数，接受 'coords', 'symbols', 'edges' 并返回 (new_smiles, new_molfile, _)
-        
-        返回:
-        - 更新后的数据结构
-        """
-        for item in input_data:
-            for bbox in item.get('bboxes', []):
-                # 检查必需的键是否存在
-                if all(key in bbox for key in ['coords', 'symbols', 'edges']):
-                    coords = bbox['coords']
-                    symbols = bbox['symbols']
-                    edges = bbox['edges']
-                    
-                    # 调用转换函数生成新的 'smiles' 和 'molfile'
-                    new_smiles, new_molfile, _ = conversion_function(coords, symbols, edges)
-            
-                    # 替换旧的 'smiles' 和 'molfile'
-                    bbox['smiles'] = new_smiles
-                    bbox['molfile'] = new_molfile
-
-        return input_data
-
-    updated_data = update_smiles_and_molfile(input2_updated, _convert_graph_to_smiles)
+    updated_data, _ = apply_smiles_conversion_to_bboxes(
+        input2_updated,
+        _convert_graph_to_smiles,
+        context="molecular_agent_correctmultiR_os.graph_conversion",
+    )
     _debug_print(f"mol_agent_output:{updated_data}")
 
     return updated_data

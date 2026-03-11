@@ -4,6 +4,7 @@ import numpy as np
 import multiprocessing
 import itertools
 import re
+from collections.abc import Sequence
 
 import rdkit
 import rdkit.Chem as Chem
@@ -22,6 +23,7 @@ from typing import List, Optional, Dict, Tuple
 import requests
 import os
 from openai import AzureOpenAI
+from runtime_guards import RuntimeStageError
 
 # Optional Azure credentials (used only when LLM-assisted symbol resolution is enabled).
 # Do not hard-fail at import time: OpenAI/local providers should still run without Azure vars.
@@ -1300,8 +1302,69 @@ def _expand_functional_group(mol, mappings, debug=True):
     return smiles, mol
 
 
+def _validate_graph_inputs(coords, symbols, edges):
+    def _is_sequence(value):
+        return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+    if not _is_sequence(coords):
+        raise RuntimeStageError(
+            "coords must be a non-string sequence",
+            context="chemistry.convert_graph_to_smiles",
+            retry_trigger="auto_recovery_retry",
+        )
+    if not _is_sequence(symbols):
+        raise RuntimeStageError(
+            "symbols must be a non-string sequence",
+            context="chemistry.convert_graph_to_smiles",
+            retry_trigger="auto_recovery_retry",
+        )
+    if not _is_sequence(edges):
+        raise RuntimeStageError(
+            "edges must be a non-string sequence",
+            context="chemistry.convert_graph_to_smiles",
+            retry_trigger="auto_recovery_retry",
+        )
+    coord_count = len(coords)
+    symbol_count = len(symbols)
+    row_count = len(edges)
+    if coord_count == 0 or symbol_count == 0:
+        raise RuntimeStageError(
+            f"graph inputs must be non-empty (coords={coord_count}, symbols={symbol_count}, edge_rows={row_count})",
+            context="chemistry.convert_graph_to_smiles",
+            retry_trigger="auto_recovery_retry",
+        )
+    if coord_count != symbol_count:
+        raise RuntimeStageError(
+            f"graph input length mismatch (coords={coord_count}, symbols={symbol_count}, edge_rows={row_count})",
+            context="chemistry.convert_graph_to_smiles",
+            retry_trigger="auto_recovery_retry",
+        )
+    if row_count != symbol_count:
+        raise RuntimeStageError(
+            f"edge matrix row mismatch (coords={coord_count}, symbols={symbol_count}, edge_rows={row_count})",
+            context="chemistry.convert_graph_to_smiles",
+            retry_trigger="auto_recovery_retry",
+        )
+    row_lengths = []
+    for row in edges:
+        if not _is_sequence(row):
+            raise RuntimeStageError(
+                "edge matrix rows must be non-string sequences",
+                context="chemistry.convert_graph_to_smiles",
+                retry_trigger="auto_recovery_retry",
+            )
+        row_lengths.append(len(row))
+    if any(length != symbol_count for length in row_lengths):
+        raise RuntimeStageError(
+            f"edge matrix must be square (coords={coord_count}, symbols={symbol_count}, row_lengths={row_lengths})",
+            context="chemistry.convert_graph_to_smiles",
+            retry_trigger="auto_recovery_retry",
+        )
+
+
 def _convert_graph_to_smiles(coords, symbols, edges, image=None, debug=False):
     print(f"symbols: {symbols}")
+    _validate_graph_inputs(coords, symbols, edges)
     mol = Chem.RWMol()
     n = len(symbols)
     ids = []

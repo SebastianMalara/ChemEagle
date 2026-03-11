@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from openai import AzureOpenAI, BadRequestError, OpenAI
 
 from llm_profiles import OPENAI_COMPATIBLE_PROVIDERS, LLMProfile, resolve_llm_profile
+from llm_preflight import classify_provider_exception
+from review_tracking import current_collector, current_phase, extract_usage_payload, normalize_usage, timed_call
+from runtime_guards import assistant_message, message_content
 
 try:
     from anthropic import Anthropic
@@ -125,6 +129,8 @@ class LLMWrapper:
             kwargs = {"api_key": profile.api_key or "EMPTY"}
             if profile.base_url:
                 kwargs["base_url"] = profile.base_url
+            elif profile.provider == "openai":
+                kwargs["base_url"] = "https://api.openai.com/v1"
             client = OpenAI(**kwargs)
             return cls(profile=profile, client=client)
 
@@ -152,6 +158,7 @@ class LLMWrapper:
         tool_choice: Optional[str] = None,
         max_tokens: Optional[int] = None,
     ) -> str:
+        phase = current_phase()
         response = self.chat_completion(
             model=model,
             messages=messages,
@@ -161,7 +168,12 @@ class LLMWrapper:
             tool_choice=tool_choice,
             max_tokens=max_tokens,
         )
-        return (response.choices[0].message.content or "").strip()
+        return message_content(
+            response,
+            context=f"{phase}: assistant response",
+            required=True,
+            retry_trigger=_retry_trigger_for_phase(phase),
+        ).strip()
 
     def chat_completion(
         self,
@@ -175,39 +187,80 @@ class LLMWrapper:
         max_tokens: Optional[int] = None,
     ) -> ChatCompletionResponse:
         model_name = model or self.model
-
-        if self.provider in OPENAI_COMPATIBLE_PROVIDERS or self.provider == "azure":
-            kwargs: Dict[str, Any] = {
-                "model": model_name,
-                "messages": messages,
-            }
-            if temperature is not None:
-                kwargs["temperature"] = temperature
-            if response_format is not None:
-                kwargs["response_format"] = response_format
-            if tools is not None:
-                kwargs["tools"] = tools
-            if tool_choice is not None:
-                kwargs["tool_choice"] = tool_choice
-            response = self._create_openai_chat_with_fallback(kwargs)
-            return self._normalize_openai_response(response)
-
-        anthropic_messages, system_prompt = self._to_anthropic_messages(messages, response_format=response_format)
-        kwargs = {
-            "model": model_name,
-            "messages": anthropic_messages,
-            "max_tokens": max_tokens or int(os.getenv("LLM_MAX_TOKENS", "2048")),
-        }
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        if system_prompt:
-            kwargs["system"] = system_prompt
-        if tools:
-            kwargs["tools"] = self._to_anthropic_tools(tools)
-        if tool_choice:
-            kwargs["tool_choice"] = self._to_anthropic_tool_choice(tool_choice)
-        response = self.client.messages.create(**kwargs)
-        return self._normalize_anthropic_response(response)
+        collector = current_collector()
+        phase = current_phase()
+        with timed_call() as elapsed_ms:
+            try:
+                if self.provider in OPENAI_COMPATIBLE_PROVIDERS or self.provider == "azure":
+                    kwargs: Dict[str, Any] = {
+                        "model": model_name,
+                        "messages": messages,
+                    }
+                    if temperature is not None:
+                        kwargs["temperature"] = temperature
+                    if response_format is not None:
+                        kwargs["response_format"] = response_format
+                    if tools is not None:
+                        kwargs["tools"] = tools
+                    if tool_choice is not None:
+                        kwargs["tool_choice"] = tool_choice
+                    response = self._create_openai_chat_with_fallback(kwargs)
+                    normalized = self._normalize_openai_response(response)
+                else:
+                    anthropic_messages, system_prompt = self._to_anthropic_messages(messages, response_format=response_format)
+                    kwargs = {
+                        "model": model_name,
+                        "messages": anthropic_messages,
+                        "max_tokens": max_tokens or int(os.getenv("LLM_MAX_TOKENS", "2048")),
+                    }
+                    if temperature is not None:
+                        kwargs["temperature"] = temperature
+                    if system_prompt:
+                        kwargs["system"] = system_prompt
+                    if tools:
+                        kwargs["tools"] = self._to_anthropic_tools(tools)
+                    if tool_choice:
+                        kwargs["tool_choice"] = self._to_anthropic_tool_choice(tool_choice)
+                    response = self.client.messages.create(**kwargs)
+                    normalized = self._normalize_anthropic_response(response)
+            except Exception as exc:
+                failure = classify_provider_exception(exc)
+                diagnostics = _build_exception_diagnostics(
+                    exc,
+                    provider=self.provider,
+                    model=model_name,
+                    phase=phase,
+                    endpoint=_profile_endpoint(self.profile),
+                )
+                if collector is not None:
+                    collector.record(
+                        phase=phase,
+                        provider=self.provider,
+                        model=model_name,
+                        usage={"prompt_tokens": None, "completion_tokens": None, "total_tokens": None},
+                        latency_ms=elapsed_ms(),
+                        success=False,
+                        raw_usage={
+                            "failure_kind": failure.kind,
+                            "message": failure.message,
+                            "diagnostics": diagnostics,
+                        },
+                    )
+                setattr(exc, "_provider_failure", failure)
+                setattr(exc, "_provider_diagnostics", diagnostics)
+                raise
+        if collector is not None:
+            raw_usage = extract_usage_payload(normalized.raw)
+            collector.record(
+                phase=phase,
+                provider=self.provider,
+                model=model_name,
+                usage=normalize_usage(raw_usage),
+                latency_ms=elapsed_ms(),
+                success=True,
+                raw_usage=raw_usage,
+            )
+        return normalized
 
     def _create_openai_chat_with_fallback(self, kwargs: Dict[str, Any]):
         try:
@@ -254,7 +307,12 @@ class LLMWrapper:
         return "response_format" in msg
 
     def _normalize_openai_response(self, response: Any) -> ChatCompletionResponse:
-        message = response.choices[0].message
+        phase = current_phase()
+        message = assistant_message(
+            response,
+            context=f"{phase}: normalize openai response",
+            retry_trigger=_retry_trigger_for_phase(phase),
+        )
         normalized_tool_calls: List[ChatToolCall] = []
         for tool_call in getattr(message, "tool_calls", None) or []:
             function_payload = getattr(tool_call, "function", None)
@@ -506,3 +564,63 @@ class LLMWrapper:
             blocks.append({"type": "text", "text": str(content)})
 
         return blocks or [{"type": "text", "text": ""}]
+
+
+def _retry_trigger_for_phase(phase: str) -> str:
+    lowered = (phase or "").strip().lower()
+    if "planner" in lowered or "observer" in lowered:
+        return "auto_no_agents_retry"
+    return "auto_recovery_retry"
+
+
+def _profile_endpoint(profile: LLMProfile) -> str:
+    if profile.provider == "azure":
+        return profile.azure_endpoint or ""
+    if profile.provider in OPENAI_COMPATIBLE_PROVIDERS:
+        return profile.base_url or "https://api.openai.com/v1"
+    if profile.provider == "anthropic":
+        return "https://api.anthropic.com"
+    return profile.base_url or profile.azure_endpoint or ""
+
+
+def _classify_llm_stage(phase: str) -> str:
+    normalized = (phase or "").strip().lower()
+    if not normalized:
+        return "unknown"
+    if normalized == "planner" or normalized.endswith(".planner"):
+        return "planner"
+    if normalized in {"ocr_vision", "ocr"} or "ocr" in normalized:
+        return "ocr"
+    if normalized == "final_synthesis" or "final_synthesis" in normalized:
+        return "final_synthesis"
+    if any(token in normalized for token in ["reaction_agent", "molecular_agent", "r_group_sub_agent", "text_agent", "tool"]):
+        return "tool_or_followup"
+    if normalized.startswith("main.chemeagle"):
+        return "planner_or_followup"
+    return "tool_or_followup"
+
+
+def _build_exception_diagnostics(
+    exc: Exception,
+    *,
+    provider: str,
+    model: str,
+    phase: str,
+    endpoint: str,
+) -> Dict[str, Any]:
+    cause = getattr(exc, "__cause__", None)
+    context = getattr(exc, "__context__", None)
+    return {
+        "provider": provider,
+        "model": model,
+        "base_url": endpoint,
+        "llm_phase": phase,
+        "llm_stage": _classify_llm_stage(phase),
+        "exception_class": exc.__class__.__name__,
+        "exception_message": str(exc),
+        "cause_class": cause.__class__.__name__ if cause else "",
+        "cause_message": str(cause) if cause else "",
+        "context_class": context.__class__.__name__ if context else "",
+        "context_message": str(context) if context else "",
+        "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
+    }
