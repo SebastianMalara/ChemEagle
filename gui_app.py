@@ -523,6 +523,8 @@ def _derived_images_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
                 "rejected_reaction_count",
                 "attempt_count",
                 "normalization_status",
+                "dominant_issue",
+                "recommended_action",
                 "last_retry_reason",
                 "error_text",
             ]
@@ -540,6 +542,8 @@ def _derived_images_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
                 "rejected_reaction_count": row.get("rejected_reaction_count", 0),
                 "attempt_count": row.get("attempt_count", 0),
                 "normalization_status": row.get("normalization_status", ""),
+                "dominant_issue": _dominant_issue_label(row),
+                "recommended_action": _recommended_action_label(row),
                 "last_retry_reason": row.get("last_retry_reason", ""),
                 "error_text": row.get("error_text", ""),
             }
@@ -591,6 +595,8 @@ def _retry_candidates_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
                 "accepted_reaction_count",
                 "rejected_reaction_count",
                 "normalization_status",
+                "dominant_issue",
+                "recommended_action",
                 "error_text",
             ]
         )
@@ -605,11 +611,44 @@ def _retry_candidates_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
                 "accepted_reaction_count": row.get("accepted_reaction_count", row.get("reaction_count", 0)),
                 "rejected_reaction_count": row.get("rejected_reaction_count", 0),
                 "normalization_status": row.get("normalization_status", ""),
+                "dominant_issue": _dominant_issue_label(row),
+                "recommended_action": _recommended_action_label(row),
                 "error_text": row.get("error_text", ""),
             }
             for row in records
         ]
     )
+
+
+def _dominant_issue_label(row: Dict[str, Any]) -> str:
+    attempts = list(row.get("attempts", []) or [])
+    latest_attempt = attempts[-1] if attempts else {}
+    failure_kind = str(latest_attempt.get("failure_kind") or "")
+    normalization_status = str(row.get("normalization_status") or "")
+    outcome_class = str(row.get("outcome_class") or "")
+    error_text = str(latest_attempt.get("error_summary") or row.get("error_text") or "").lower()
+    if failure_kind == "provider_systemic":
+        return "systemic provider failure"
+    if failure_kind in {"planner_empty", "tool_call_empty"} or "no agents" in error_text:
+        return "empty planner/tool output"
+    if normalization_status in {"rejected_missing_smiles", "rejected_invalid_smiles", "partial"}:
+        return "rejected by structure gate"
+    if outcome_class == "needs_redo" or normalization_status == "redo_pending":
+        return "redo with recoverable nested reactions"
+    if failure_kind == "local_runtime_error" or str(row.get("status") or "") == "failed":
+        return "local runtime crash"
+    return ""
+
+
+def _recommended_action_label(row: Dict[str, Any]) -> str:
+    issue = _dominant_issue_label(row)
+    if issue == "empty planner/tool output":
+        return "Retry with no_agents"
+    if issue == "local runtime crash":
+        return "Retry with recovery"
+    if issue in {"redo with recoverable nested reactions", "rejected by structure gate"}:
+        return "Reprocess normalization from raw"
+    return ""
 
 
 def _reactions_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -829,6 +868,7 @@ def _html_escape(value: Any) -> str:
 def _render_progress_monitor(monitor: Dict[str, Any]) -> str:
     progress = monitor.get("progress", {}) or {}
     run = monitor.get("run", {}) or {}
+    aggregates = monitor.get("aggregates", {}) or {}
     progress_fraction = max(0.0, min(float(progress.get("progress_fraction", 0.0) or 0.0), 1.0))
     width_percent = round(progress_fraction * 100, 1)
     active = bool(progress.get("is_active"))
@@ -845,6 +885,18 @@ def _render_progress_monitor(monitor: Dict[str, Any]) -> str:
     run_id = run.get("run_id") or ""
     experiment_id = run.get("experiment_id") or ""
     progress_label = progress.get("progress_label") or "0/0 sources finished"
+    aggregate_items = [
+        ("Provider", aggregates.get("systemic_provider_failures", 0)),
+        ("Planner/Tool", aggregates.get("planner_tool_empties", 0)),
+        ("Local", aggregates.get("local_runtime_crashes", 0)),
+        ("Rejected", aggregates.get("normalization_rejects", 0)),
+        ("Salvageable", aggregates.get("salvageable_from_raw", 0)),
+    ]
+    aggregate_html = "".join(
+        f'<span style="display:inline-block;margin:4px 8px 0 0;padding:4px 8px;border-radius:999px;background:#fff7ed;color:#9a3412;font-size:12px;">{_html_escape(label)} {_html_escape(value)}</span>'
+        for label, value in aggregate_items
+        if value
+    )
     return f"""
 <style>
 .ce-monitor {{
@@ -910,6 +962,7 @@ def _render_progress_monitor(monitor: Dict[str, Any]) -> str:
   </div>
   <div class="ce-monitor-bar"><div class="ce-monitor-bar-fill"></div></div>
   <div class="ce-monitor-summary">{_html_escape(summary)}</div>
+  <div class="ce-monitor-summary">{aggregate_html}</div>
 </div>
 """.strip()
 
@@ -2031,6 +2084,7 @@ def refresh_ingest_monitor(
         {
             "run": run_row,
             "progress": progress,
+            "aggregates": monitor.get("aggregates", {}),
             "sources": monitor.get("sources", []),
             "log_tail_events": log_tail.get("events", []),
         }
@@ -2118,6 +2172,7 @@ def refresh_runs_view(
             {
                 "run": run_row,
                 "progress": progress,
+                "aggregates": monitor.get("aggregates", {}),
                 "sources": source_rows,
                 "log_tail_events": log_tail.get("events", []),
             }

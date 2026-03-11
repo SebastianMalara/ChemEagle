@@ -11,6 +11,7 @@ from openai import AzureOpenAI, BadRequestError, OpenAI
 from llm_profiles import OPENAI_COMPATIBLE_PROVIDERS, LLMProfile, resolve_llm_profile
 from llm_preflight import classify_provider_exception
 from review_tracking import current_collector, current_phase, extract_usage_payload, normalize_usage, timed_call
+from runtime_guards import assistant_message, message_content
 
 try:
     from anthropic import Anthropic
@@ -157,6 +158,7 @@ class LLMWrapper:
         tool_choice: Optional[str] = None,
         max_tokens: Optional[int] = None,
     ) -> str:
+        phase = current_phase()
         response = self.chat_completion(
             model=model,
             messages=messages,
@@ -166,7 +168,12 @@ class LLMWrapper:
             tool_choice=tool_choice,
             max_tokens=max_tokens,
         )
-        return (response.choices[0].message.content or "").strip()
+        return message_content(
+            response,
+            context=f"{phase}: assistant response",
+            required=True,
+            retry_trigger=_retry_trigger_for_phase(phase),
+        ).strip()
 
     def chat_completion(
         self,
@@ -300,7 +307,12 @@ class LLMWrapper:
         return "response_format" in msg
 
     def _normalize_openai_response(self, response: Any) -> ChatCompletionResponse:
-        message = response.choices[0].message
+        phase = current_phase()
+        message = assistant_message(
+            response,
+            context=f"{phase}: normalize openai response",
+            retry_trigger=_retry_trigger_for_phase(phase),
+        )
         normalized_tool_calls: List[ChatToolCall] = []
         for tool_call in getattr(message, "tool_calls", None) or []:
             function_payload = getattr(tool_call, "function", None)
@@ -552,6 +564,13 @@ class LLMWrapper:
             blocks.append({"type": "text", "text": str(content)})
 
         return blocks or [{"type": "text", "text": ""}]
+
+
+def _retry_trigger_for_phase(phase: str) -> str:
+    lowered = (phase or "").strip().lower()
+    if "planner" in lowered or "observer" in lowered:
+        return "auto_no_agents_retry"
+    return "auto_recovery_retry"
 
 
 def _profile_endpoint(profile: LLMProfile) -> str:

@@ -47,6 +47,25 @@ TRANSIENT_RETRY_KINDS = {"timeout", "rate_limited", "provider_overloaded"}
 LOCAL_RECOVERY_EXCEPTIONS = (IndexError, AttributeError, TypeError, KeyError, ValueError)
 MAX_AUTO_ATTEMPTS_PER_DERIVED_IMAGE = 3
 MAX_MANUAL_ATTEMPTS_PER_DERIVED_IMAGE = 5
+PROVIDER_FAILURE_KINDS = {
+    "auth_error",
+    "endpoint_unreachable",
+    "dns_or_connection_error",
+    "timeout",
+    "rate_limited",
+    "provider_overloaded",
+    "bad_request_non_retryable",
+    "unsupported_model_or_capability",
+    "unknown_provider_error",
+}
+STABLE_FAILURE_CATEGORIES = {
+    "provider_systemic",
+    "planner_empty",
+    "tool_call_empty",
+    "local_runtime_error",
+    "normalization_rejected",
+    "redo_pending",
+}
 
 
 @dataclass(frozen=True)
@@ -631,6 +650,148 @@ def _diagnostic_error_summary(exc: Exception, diagnostics: Dict[str, Any]) -> st
     return " | ".join(part for part in parts if part)
 
 
+def _stable_failure_category(
+    *,
+    failure_kind: str = "",
+    error_summary: str = "",
+    normalization_status: str = "",
+    normalization_summary: str = "",
+    outcome_class: str = "",
+    llm_stage: str = "",
+    llm_phase: str = "",
+    systemic: bool = False,
+) -> str:
+    normalized_failure_kind = str(failure_kind or "").strip()
+    normalized_status = str(normalization_status or "").strip()
+    normalized_outcome = str(outcome_class or "").strip()
+    lowered = " | ".join(
+        part
+        for part in (
+            error_summary,
+            normalization_summary,
+            normalized_failure_kind,
+            llm_stage,
+            llm_phase,
+        )
+        if part
+    ).lower()
+    if normalized_failure_kind in STABLE_FAILURE_CATEGORIES:
+        return normalized_failure_kind
+    if normalized_status in {"rejected_missing_smiles", "rejected_invalid_smiles"}:
+        return "normalization_rejected"
+    if normalized_status == "partial" and normalized_outcome != "succeeded":
+        return "normalization_rejected"
+    if normalized_outcome == "needs_redo" or normalized_status == "redo_pending":
+        return "redo_pending"
+    if any(token in lowered for token in ("connection error", "unsupportedprotocol", "endpoint=", "cause=connecterror", "cause=unsupportedprotocol")):
+        return "provider_systemic"
+    if systemic or normalized_failure_kind in PROVIDER_FAILURE_KINDS:
+        return "provider_systemic"
+    if "assistant message has no tool calls" in lowered or "no tool calls" in lowered:
+        return "tool_call_empty"
+    if (
+        "response choices" in lowered
+        or "missing assistant message" in lowered
+        or "assistant message content is empty" in lowered
+        or "warning: no agents" in lowered
+        or "returned no agents" in lowered
+        or ("planner" in lowered and "empty" in lowered)
+    ):
+        return "planner_empty"
+    if lowered:
+        return "local_runtime_error"
+    return ""
+
+
+def _terminal_normalization_status(
+    *,
+    status: str,
+    outcome_class: str,
+    normalization_status: str,
+    normalization_summary: str,
+    rejected_reaction_count: int,
+    failure_category: str,
+) -> str:
+    if normalization_status:
+        return normalization_status
+    if failure_category == "normalization_rejected":
+        if "rejected_invalid_smiles" in normalization_summary:
+            return "rejected_invalid_smiles"
+        if rejected_reaction_count > 0:
+            return "rejected_missing_smiles"
+        return "rejected_missing_smiles"
+    if outcome_class == "needs_redo" or failure_category == "redo_pending":
+        return "redo_pending"
+    if outcome_class == "empty":
+        return "none_found"
+    if status in {"failed", "aborted"}:
+        return "none_found"
+    return ""
+
+
+def _terminal_attempt_status(derived_status: str, latest_attempt_status: str) -> str:
+    latest = str(latest_attempt_status or "").strip()
+    if latest in {"completed", "failed", "aborted"}:
+        return latest
+    status = str(derived_status or "").strip()
+    if status in {"completed", "failed", "aborted"}:
+        return status
+    return latest or "failed"
+
+
+def _run_issue_aggregate(detail: Dict[str, Any]) -> str:
+    attempts = list(detail.get("attempts", []) or [])
+    latest_attempt = attempts[-1] if attempts else {}
+    failure_kind = str(latest_attempt.get("failure_kind") or "")
+    normalization_status = str(detail.get("normalization_status") or "")
+    outcome_class = str(detail.get("outcome_class") or "")
+    error_summary = str(latest_attempt.get("error_summary") or detail.get("error_text") or "")
+    category = _stable_failure_category(
+        failure_kind=failure_kind,
+        error_summary=error_summary,
+        normalization_status=normalization_status,
+        normalization_summary=str(detail.get("normalization_summary") or ""),
+        outcome_class=outcome_class,
+    )
+    if category == "provider_systemic":
+        return "systemic_provider_failure"
+    if category == "planner_empty":
+        return "empty_planner_tool_output"
+    if category == "tool_call_empty":
+        return "empty_planner_tool_output"
+    if category == "normalization_rejected":
+        return "rejected_by_structure_gate"
+    if category == "redo_pending":
+        return "redo_with_recoverable_nested_reactions"
+    if category == "local_runtime_error":
+        return "local_runtime_crash"
+    return ""
+
+
+def _recommended_retry_action(detail: Dict[str, Any]) -> str:
+    issue = _run_issue_aggregate(detail)
+    if issue == "empty_planner_tool_output":
+        return "Retry with no_agents"
+    if issue == "local_runtime_crash":
+        return "Retry with recovery"
+    if issue in {"redo_with_recoverable_nested_reactions", "rejected_by_structure_gate"}:
+        return "Reprocess normalization from raw"
+    return ""
+
+
+def _is_salvageable_from_raw(detail: Dict[str, Any]) -> bool:
+    if not str(detail.get("raw_artifact_key") or ""):
+        return False
+    if int(detail.get("accepted_reaction_count", detail.get("reaction_count", 0)) or 0) > 0:
+        return False
+    normalization_status = str(detail.get("normalization_status") or "")
+    outcome_class = str(detail.get("outcome_class") or "")
+    return normalization_status in {"redo_pending", "partial", "rejected_missing_smiles", "rejected_invalid_smiles"} or outcome_class in {
+        "needs_redo",
+        "failed",
+    }
+
+
 def _retry_backoff_seconds(attempt_no: int) -> float:
     return min(8.0, float(2 ** max(0, attempt_no - 1)))
 
@@ -881,35 +1042,71 @@ class ReviewDatasetService:
         config_snapshot: Dict[str, Any],
     ) -> Dict[str, Any]:
         attempts = list(detail.get("attempts", []) or [])
+        derived_status = str(detail.get("status") or "completed")
+        if derived_status == "processing":
+            derived_status = "failed"
+        expected_failure_kind = _stable_failure_category(
+            failure_kind="",
+            error_summary=str(detail.get("error_text") or ""),
+            normalization_status=str(detail.get("normalization_status") or ""),
+            normalization_summary=str(detail.get("normalization_summary") or ""),
+            outcome_class=str(detail.get("outcome_class") or ""),
+        )
+        expected_normalization_status = _terminal_normalization_status(
+            status=derived_status,
+            outcome_class=str(detail.get("outcome_class") or ""),
+            normalization_status=str(detail.get("normalization_status") or ""),
+            normalization_summary=str(detail.get("normalization_summary") or ""),
+            rejected_reaction_count=int(detail.get("rejected_reaction_count", 0) or 0),
+            failure_category=expected_failure_kind,
+        )
         if attempts:
-            return detail
-        bootstrap_status = str(detail.get("status") or "completed")
-        if bootstrap_status == "processing":
-            bootstrap_status = "failed"
+            latest_attempt = attempts[-1]
+            updates: Dict[str, Any] = {}
+            terminal_attempt_status = _terminal_attempt_status(derived_status, str(latest_attempt.get("status") or ""))
+            if terminal_attempt_status and terminal_attempt_status != str(latest_attempt.get("status") or ""):
+                updates["status"] = terminal_attempt_status
+                if terminal_attempt_status in {"completed", "failed", "aborted"}:
+                    updates["finished"] = True
+            if detail.get("error_text") and not latest_attempt.get("error_summary"):
+                updates["error_summary"] = str(detail.get("error_text") or "")
+            if detail.get("raw_artifact_key") and not latest_attempt.get("raw_artifact_key"):
+                updates["raw_artifact_key"] = str(detail.get("raw_artifact_key") or "")
+            if expected_failure_kind and not latest_attempt.get("failure_kind"):
+                updates["failure_kind"] = expected_failure_kind
+            if updates:
+                self.repository.update_derived_image_attempt(str(latest_attempt["attempt_id"]), **updates)
+            if expected_normalization_status and not detail.get("normalization_status"):
+                self.repository.update_derived_image_status(
+                    derived_image_id,
+                    normalization_status=expected_normalization_status,
+                    normalization_summary=str(detail.get("normalization_summary") or ""),
+                )
+            return self.repository.get_derived_image(derived_image_id)
         bootstrap_attempt = self.repository.create_derived_image_attempt(
             derived_image_id=derived_image_id,
             trigger="initial",
             execution_mode="normal",
-            status=bootstrap_status,
+            status=derived_status,
             config_snapshot_json=_json_dumps(config_snapshot),
         )
         self.repository.finalize_derived_image_attempt(
             str(bootstrap_attempt["attempt_id"]),
             {
-                "status": bootstrap_status,
-                "failure_kind": "",
+                "status": derived_status,
+                "failure_kind": expected_failure_kind,
                 "error_summary": str(detail.get("error_text") or ""),
                 "raw_artifact_key": str(detail.get("raw_artifact_key") or ""),
                 "usage_completeness": "none",
             },
         )
-        self.repository.finalize_derived_image_summary(
+        self.repository.update_derived_image_status(
             derived_image_id,
-            {
-                "attempt_count": int(bootstrap_attempt["attempt_no"]),
-                "last_attempt_id": str(bootstrap_attempt["attempt_id"]),
-                "last_retry_reason": "initial",
-            },
+            attempt_count=int(bootstrap_attempt["attempt_no"]),
+            last_attempt_id=str(bootstrap_attempt["attempt_id"]),
+            last_retry_reason="initial",
+            normalization_status=(expected_normalization_status if not detail.get("normalization_status") else None),
+            normalization_summary=(str(detail.get("normalization_summary") or "") if expected_normalization_status and not detail.get("normalization_status") else None),
         )
         return self.repository.get_derived_image(derived_image_id)
 
@@ -996,9 +1193,15 @@ class ReviewDatasetService:
             last_attempt = attempts[-1] if attempts else {}
             execution_mode = "normal"
             trigger = "manual_retry"
-            if outcome_class == "needs_redo" or str(row.get("normalization_status") or "") == "redo_pending":
+            last_failure_kind = str(last_attempt.get("failure_kind") or "")
+            if last_failure_kind in {"planner_empty", "tool_call_empty"}:
                 execution_mode = "no_agents"
                 trigger = "manual_no_agents_retry"
+            elif outcome_class == "needs_redo" or str(row.get("normalization_status") or "") == "redo_pending":
+                execution_mode = "no_agents"
+                trigger = "manual_no_agents_retry"
+            elif last_failure_kind == "local_runtime_error" and str(last_attempt.get("execution_mode") or "") == "no_agents":
+                execution_mode = "recovery"
             elif str(last_attempt.get("execution_mode") or "") == "no_agents":
                 execution_mode = "recovery"
             self.retry_derived_image(str(row["derived_image_id"]), trigger=trigger, execution_mode=execution_mode)
@@ -1042,9 +1245,20 @@ class ReviewDatasetService:
                 payload=payload,
             )
             outcome_class = _classify_payload(payload, artifact_missing=(str(detail.get("artifact_status") or "") == "missing"))
+            attempt_failure_kind = _stable_failure_category(
+                normalization_status=normalization.normalization_status,
+                normalization_summary=normalization.normalization_summary,
+                outcome_class=outcome_class,
+                error_summary=str(payload.get("error") or ""),
+            )
             self.repository.finalize_derived_image_attempt(
                 str(attempt["attempt_id"]),
-                {"status": "completed", "raw_artifact_key": raw_key},
+                {
+                    "status": "completed",
+                    "failure_kind": attempt_failure_kind,
+                    "raw_artifact_key": raw_key,
+                    "error_summary": str(payload.get("error") or ""),
+                },
             )
             self.repository.finalize_derived_image_summary(
                 derived_image_id,
@@ -1094,31 +1308,45 @@ class ReviewDatasetService:
 
     def run_dataset_maintenance(self, run_id: str = "") -> Dict[str, Any]:
         target_runs = [run_id] if run_id else [str(row["run_id"]) for row in self.repository.list_runs()]
-        summary = {"runs": 0, "seeded_attempts": 0, "reprocessed_derived_images": 0, "accepted_reactions": 0}
+        summary = {
+            "runs": 0,
+            "seeded_attempts": 0,
+            "repaired_attempts": 0,
+            "normalized_terminal_rows": 0,
+            "reprocessed_derived_images": 0,
+            "accepted_reactions": 0,
+        }
         for current_run_id in target_runs:
             if not current_run_id:
                 continue
+            run = self.repository.get_run(current_run_id)
+            config_snapshot = json.loads((run or {}).get("config_snapshot_json") or "{}")
             for source in self.repository.list_run_sources(current_run_id):
                 detail = self.repository.get_run_source_detail(str(source["run_source_id"]))
                 for derived in detail.get("derived_images", []):
-                    attempts = derived.get("attempts", [])
-                    if not attempts:
-                        attempt = self.repository.create_derived_image_attempt(
-                            derived_image_id=str(derived["derived_image_id"]),
-                            trigger="initial",
-                            execution_mode="normal",
-                            status=str(derived.get("status") or "completed"),
-                            config_snapshot_json="{}",
-                        )
-                        self.repository.finalize_derived_image_attempt(
-                            str(attempt["attempt_id"]),
-                            {
-                                "status": str(derived.get("status") or "completed"),
-                                "error_summary": str(derived.get("error_text") or ""),
-                                "raw_artifact_key": str(derived.get("raw_artifact_key") or ""),
-                            },
-                        )
+                    before_attempts = list(derived.get("attempts", []) or [])
+                    before_attempt_count = len(before_attempts)
+                    before_normalization = str(derived.get("normalization_status") or "")
+                    repaired = self._ensure_attempt_history(
+                        derived_image_id=str(derived["derived_image_id"]),
+                        detail=derived,
+                        config_snapshot=config_snapshot,
+                    )
+                    after_attempts = list(repaired.get("attempts", []) or [])
+                    if len(after_attempts) > before_attempt_count:
                         summary["seeded_attempts"] += 1
+                    elif after_attempts and before_attempts:
+                        latest_before = before_attempts[-1]
+                        latest_after = after_attempts[-1]
+                        if (
+                            str(latest_before.get("status") or "") != str(latest_after.get("status") or "")
+                            or str(latest_before.get("failure_kind") or "") != str(latest_after.get("failure_kind") or "")
+                            or str(latest_before.get("raw_artifact_key") or "") != str(latest_after.get("raw_artifact_key") or "")
+                            or str(latest_before.get("error_summary") or "") != str(latest_after.get("error_summary") or "")
+                        ):
+                            summary["repaired_attempts"] += 1
+                    if not before_normalization and repaired.get("normalization_status"):
+                        summary["normalized_terminal_rows"] += 1
             run_summary = self.reprocess_normalization_for_run(current_run_id, only_invalid_reactions=False)
             summary["runs"] += 1
             summary["reprocessed_derived_images"] += int(run_summary.get("derived_images", 0))
@@ -1152,11 +1380,50 @@ class ReviewDatasetService:
             run,
             has_logs=bool(log_tail.get("events") or run.get("log_artifact_key") or run.get("stdout_artifact_key") or run.get("stderr_artifact_key")),
         )
+        source_details = [self.repository.get_run_source_detail(str(row["run_source_id"])) for row in sources]
+        derived_images = [derived for detail in source_details for derived in detail.get("derived_images", [])]
+        issue_aggregates = {
+            "systemic_provider_failures": 0,
+            "planner_tool_empties": 0,
+            "local_runtime_crashes": 0,
+            "normalization_rejects": 0,
+            "salvageable_from_raw": 0,
+        }
+        for derived in derived_images:
+            issue = _run_issue_aggregate(derived)
+            if issue == "systemic_provider_failure":
+                issue_aggregates["systemic_provider_failures"] += 1
+            elif issue == "empty_planner_tool_output":
+                issue_aggregates["planner_tool_empties"] += 1
+            elif issue == "local_runtime_crash":
+                issue_aggregates["local_runtime_crashes"] += 1
+            elif issue == "rejected_by_structure_gate":
+                issue_aggregates["normalization_rejects"] += 1
+            if _is_salvageable_from_raw(derived):
+                issue_aggregates["salvageable_from_raw"] += 1
+        issue_aggregates["suppressed_log_events_in_tail"] = sum(
+            1
+            for event in log_tail.get("events", [])
+            if bool(event.get("suppressed"))
+        )
+        progress["status_summary"] = (
+            str(progress.get("status_summary") or "")
+            + (
+                f" | salvageable={issue_aggregates['salvageable_from_raw']} "
+                f"rejects={issue_aggregates['normalization_rejects']} "
+                f"planner/tool empties={issue_aggregates['planner_tool_empties']} "
+                f"local crashes={issue_aggregates['local_runtime_crashes']} "
+                f"provider={issue_aggregates['systemic_provider_failures']}"
+                if derived_images
+                else ""
+            )
+        ).strip()
         return {
             "run": run,
             "progress": progress,
             "sources": sources,
             "log_tail": log_tail,
+            "aggregates": issue_aggregates,
         }
 
     def get_run_log_tail(
@@ -1828,13 +2095,6 @@ class ReviewDatasetService:
                     status="completed",
                     config_snapshot_json=_json_dumps(task.config_snapshot),
                 )
-                self.repository.finalize_derived_image_attempt(
-                    str(attempt["attempt_id"]),
-                    {
-                        "status": "completed",
-                        "raw_artifact_key": raw_item_key,
-                    },
-                )
                 outcome_class = _classify_payload(item, artifact_missing=(artifact_status == "missing"))
                 normalization = self._persist_reactions(
                     store=store,
@@ -1845,10 +2105,25 @@ class ReviewDatasetService:
                     payload=item,
                     override_outcome="imported_without_artifact" if artifact_status == "missing" else "",
                 )
+                attempt_failure_kind = _stable_failure_category(
+                    normalization_status=normalization.normalization_status,
+                    normalization_summary=normalization.normalization_summary,
+                    outcome_class=outcome_class,
+                    error_summary=str(item.get("error") or ""),
+                )
+                self.repository.finalize_derived_image_attempt(
+                    str(attempt["attempt_id"]),
+                    {
+                        "status": "completed",
+                        "failure_kind": attempt_failure_kind,
+                        "raw_artifact_key": raw_item_key,
+                        "error_summary": str(item.get("error") or ""),
+                    },
+                )
                 self.repository.finalize_derived_image_summary(
                     derived_image_id,
                     {
-                        "status": "completed",
+                        "status": "completed" if outcome_class != "failed" else "failed",
                         "status_message": f"Sideload item {image_name} imported.",
                         "outcome_class": outcome_class,
                         "raw_artifact_key": raw_item_key,
@@ -2060,10 +2335,16 @@ class ReviewDatasetService:
                     )
                     outcome_class = _classify_payload(payload)
                     metrics_summary = metrics.summary()
+                    attempt_failure_kind = _stable_failure_category(
+                        normalization_status=normalization.normalization_status,
+                        normalization_summary=normalization.normalization_summary,
+                        outcome_class=outcome_class,
+                    )
                     self.repository.finalize_derived_image_attempt(
                         attempt_id,
                         {
                             "status": "completed",
+                            "failure_kind": attempt_failure_kind,
                             "raw_artifact_key": raw_key,
                             "error_summary": str(payload.get("error") or ""),
                             "prompt_tokens": metrics_summary["prompt_tokens"],
@@ -2164,11 +2445,18 @@ class ReviewDatasetService:
                             call_metrics=[call.to_record() for call in collector.calls],
                         )
                     error_summary = _diagnostic_error_summary(exc, diagnostics)
+                    failure_category = _stable_failure_category(
+                        failure_kind=failure.kind,
+                        error_summary=error_summary,
+                        llm_stage=str(diagnostics.get("llm_stage") or ""),
+                        llm_phase=str(diagnostics.get("llm_phase") or ""),
+                        systemic=bool(getattr(failure, "systemic", False)),
+                    )
                     self.repository.finalize_derived_image_attempt(
                         attempt_id,
                         {
                             "status": "failed",
-                            "failure_kind": failure.kind,
+                            "failure_kind": failure_category,
                             "error_summary": error_summary,
                             "raw_artifact_key": raw_key,
                             "prompt_tokens": metrics_summary["prompt_tokens"],
@@ -2217,8 +2505,15 @@ class ReviewDatasetService:
                             "error_text": error_summary,
                             "accepted_reaction_count": 0,
                             "rejected_reaction_count": 0,
-                            "normalization_status": "redo_pending" if current_trigger == "auto_recovery_retry" else "none_found",
-                            "normalization_summary": "",
+                            "normalization_status": _terminal_normalization_status(
+                                status="failed",
+                                outcome_class="failed",
+                                normalization_status="",
+                                normalization_summary="",
+                                rejected_reaction_count=0,
+                                failure_category=failure_category,
+                            ),
+                            "normalization_summary": f"failure_category={failure_category}",
                             "prompt_tokens": metrics_summary["prompt_tokens"],
                             "completion_tokens": metrics_summary["completion_tokens"],
                             "total_tokens": metrics_summary["total_tokens"],
@@ -2238,6 +2533,7 @@ class ReviewDatasetService:
                     derived_logger.error(
                         "derived_image_failed",
                         f"Derived image {image_index + 1} failed for {source_name}: {exc}",
+                        category=failure_category,
                         failure_kind=failure.kind,
                         systemic=failure.systemic,
                         llm_stage=diagnostics.get("llm_stage", ""),

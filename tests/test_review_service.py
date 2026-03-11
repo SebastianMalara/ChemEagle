@@ -662,10 +662,67 @@ class ReviewServiceTests(unittest.TestCase):
             self.assertEqual(monitor["progress"]["progress_completed_sources"], 1)
             self.assertEqual(monitor["progress"]["current_phase_label"], "Failed")
             self.assertTrue(monitor["progress"]["has_troubleshooting_logs"])
+            self.assertEqual(monitor["aggregates"]["systemic_provider_failures"], 1)
 
             source_detail = service.get_run_source_monitor(monitor["sources"][0]["run_source_id"])
             self.assertEqual(len(source_detail["derived_images"]), 1)
             self.assertEqual(source_detail["derived_images"][0]["status"], "failed")
+
+    def test_dataset_maintenance_repairs_blank_failure_kind_and_normalization_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            repo = ReviewRepository(tmp / "review.sqlite3")
+            experiment_id = repo.create_experiment(name="exp")
+            run_id = repo.create_run(
+                experiment_id=experiment_id,
+                profile_label="baseline",
+                ingest_mode="live_batch",
+                status="completed",
+                config_snapshot={"ARTIFACT_BACKEND": "filesystem", "ARTIFACT_FILESYSTEM_ROOT": str(tmp / "artifacts")},
+                config_hash="hash",
+            )
+            source_asset_id = repo.upsert_source_asset(
+                source_asset_id="source-a",
+                source_type="image",
+                sha256="sha-a",
+                original_filename="broken.png",
+                artifact_backend="filesystem",
+                artifact_key="sources/source-a/original.png",
+                artifact_status="present",
+            )
+            run_source_id = repo.create_run_source(run_id=run_id, source_asset_id=source_asset_id, input_order=0, source_type="image")
+            derived_image_id = repo.create_derived_image(
+                run_source_id=run_source_id,
+                page_hint="broken.png",
+                image_index=0,
+                artifact_backend="filesystem",
+                artifact_key="derived/source-a/0.png",
+                artifact_status="present",
+                status="failed",
+                outcome_class="failed",
+                raw_artifact_key="",
+                error_text="Connection error.",
+            )
+            attempt = repo.create_derived_image_attempt(
+                derived_image_id=derived_image_id,
+                trigger="initial",
+                execution_mode="normal",
+                status="queued",
+                config_snapshot_json="{}",
+            )
+            repo.update_derived_image_status(derived_image_id, last_attempt_id=str(attempt["attempt_id"]), attempt_count=1)
+
+            service = ReviewDatasetService(repo)
+            summary = service.run_dataset_maintenance(run_id)
+
+            detail = service.get_run_source_monitor(run_source_id)
+            derived = detail["derived_images"][0]
+            latest_attempt = derived["attempts"][-1]
+            self.assertGreaterEqual(summary["repaired_attempts"], 1)
+            self.assertEqual(latest_attempt["status"], "failed")
+            self.assertEqual(latest_attempt["failure_kind"], "provider_systemic")
+            self.assertEqual(latest_attempt["error_summary"], "Connection error.")
+            self.assertEqual(derived["normalization_status"], "none_found")
 
     def test_service_recovers_stale_running_runs_on_startup(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

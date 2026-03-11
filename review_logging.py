@@ -77,6 +77,13 @@ _KNOWN_LIBRARY_NOISE_RULES = (
         ),
     ),
     (
+        "transformers_tensor_copy_warning",
+        (
+            "transformers/pytorch_utils.py:333",
+            "to copy construct from a tensor",
+        ),
+    ),
+    (
         "transformers_encoder_config_dump",
         (
             "config of the encoder:",
@@ -255,7 +262,7 @@ class _CapturedStream:
     def _should_continue_pending(self, text: str) -> bool:
         stripped = text.strip()
         if self._pending_kind == "warning":
-            return stripped.startswith("warnings.warn")
+            return stripped.startswith("warnings.warn") or text.startswith(" ")
         if self._pending_kind == "config_dump":
             return True
         if self._pending_kind == "traceback":
@@ -298,6 +305,8 @@ class _ConsoleMirrorHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         extra = getattr(record, "event_extra", {}) or {}
         if extra.get("suppressed"):
+            return
+        if record.levelno < logging.INFO:
             return
         stream = getattr(sys, "__stderr__", None) or sys.stderr
         if stream is None:
@@ -609,6 +618,14 @@ def classify_stream_text(text: str, stream: str, *, default_level: str = "INFO")
         category = "observer_warning"
         level = "WARNING"
         signature = "observer_unsupported_tool"
+    elif "warning: no agents" in lowered or "returned no agents" in lowered:
+        category = "planner_empty"
+        level = "WARNING"
+        signature = "planner_no_agents"
+    elif lowered.startswith("symbols:") or lowered.startswith("cands:"):
+        category = "molecule_debug"
+        level = "DEBUG"
+        signature = _normalized_signature(text)
     elif "userwarning:" in lowered or lowered.startswith("warning:") or lowered.startswith("[warning]"):
         category = "warning"
         level = "WARNING"

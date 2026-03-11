@@ -7,6 +7,7 @@ from unittest import mock
 from llm_profiles import LLMProfile
 from llm_wrapper import LLMWrapper
 from review_tracking import RunMetricsCollector, bind_metrics_collector, llm_phase
+from runtime_guards import RuntimeStageError
 
 
 class _FailingCompletions:
@@ -25,6 +26,16 @@ class _FailingChat:
 class _FailingClient:
     def __init__(self, exc: Exception):
         self.chat = _FailingChat(exc)
+
+
+class _EmptyChoicesCompletions:
+    def create(self, **_: object):
+        return type("Response", (), {"choices": []})()
+
+
+class _EmptyChoicesClient:
+    def __init__(self):
+        self.chat = type("Chat", (), {"completions": _EmptyChoicesCompletions()})()
 
 
 class LLMWrapperTests(unittest.TestCase):
@@ -86,6 +97,21 @@ class LLMWrapperTests(unittest.TestCase):
         raw_usage = json.loads(call.raw_usage_json)
         self.assertEqual(raw_usage["failure_kind"], "dns_or_connection_error")
         self.assertEqual(raw_usage["diagnostics"]["llm_stage"], "planner")
+
+    def test_empty_choices_raise_runtime_stage_error_with_retry_hint(self) -> None:
+        profile = LLMProfile(
+            scope="main",
+            provider="openai",
+            model="gpt-5-mini",
+            api_key="test-key",
+        )
+        wrapper = LLMWrapper(profile=profile, client=_EmptyChoicesClient())
+
+        with llm_phase("planner"), self.assertRaises(RuntimeStageError) as raised:
+            wrapper.chat_completion_text(messages=[{"role": "user", "content": "Hello"}])
+
+        self.assertIn("response choices", str(raised.exception))
+        self.assertEqual(getattr(raised.exception, "_retry_trigger", ""), "auto_no_agents_retry")
 
 
 if __name__ == "__main__":

@@ -83,7 +83,7 @@ def _select_primary_tool(agent_list: list[str]) -> str:
     if "get_multi_molecular_full" in normalized_agents:
         return "get_multi_molecular_full"
 
-    print("warning: no agents")
+    print("warning: planner observer returned no agents; using fallback tool get_full_reaction_template")
     return "get_full_reaction_template"
 
 
