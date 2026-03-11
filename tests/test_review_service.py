@@ -9,6 +9,7 @@ from unittest import mock
 
 from PIL import Image
 
+import review_service as review_service_module
 from review_db import ReviewRepository
 from review_service import ReviewDatasetService, _apply_runtime_env, _rewrite_payload_image_refs
 from review_tracking import RunMetricsCollector
@@ -379,6 +380,92 @@ class ReviewServiceTests(unittest.TestCase):
             self.assertEqual(attempts[-1]["execution_mode"], "no_agents")
             self.assertEqual(attempts[-1]["trigger"], "manual_no_agents_retry")
 
+    def test_retry_derived_image_persists_partial_payload_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db_path = tmp / "review.sqlite3"
+            artifact_root = tmp / "artifacts"
+            image_path = tmp / "retry_partial.png"
+            Image.new("RGB", (64, 64), "white").save(image_path)
+            store = create_artifact_store_from_config(
+                {"ARTIFACT_BACKEND": "filesystem", "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root)}
+            )
+            artifact_key = "derived/run-source/0.png"
+            store.put_file(artifact_key, str(image_path), content_type="image/png")
+
+            repo = ReviewRepository(db_path)
+            experiment_id = repo.create_experiment(name="exp")
+            run_id = repo.create_run(
+                experiment_id=experiment_id,
+                profile_label="baseline",
+                ingest_mode="live_batch",
+                status="completed",
+                config_snapshot={
+                    "ARTIFACT_BACKEND": "filesystem",
+                    "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root),
+                    "CHEMEAGLE_RUN_MODE": "cloud",
+                },
+                config_hash="hash",
+            )
+            source_asset_id = repo.upsert_source_asset(
+                source_asset_id="source-a",
+                source_type="image",
+                sha256="abc123",
+                original_filename="retry_partial.png",
+                artifact_backend="filesystem",
+                artifact_key="sources/source-a/original.png",
+                artifact_status="present",
+            )
+            run_source_id = repo.create_run_source(run_id=run_id, source_asset_id=source_asset_id, input_order=0, source_type="image")
+            derived_image_id = repo.create_derived_image(
+                run_source_id=run_source_id,
+                page_hint="retry_partial.png",
+                image_index=0,
+                artifact_backend="filesystem",
+                artifact_key=artifact_key,
+                artifact_status="present",
+                status="failed",
+                outcome_class="failed",
+                raw_artifact_key="",
+                error_text="list index out of range",
+            )
+            service = ReviewDatasetService(repo)
+            partial_payload = {
+                "partial": True,
+                "error": "list index out of range",
+                "traceback": "Traceback...",
+                "image_path": "/tmp/worker/retry_partial.png",
+                "failed_tool_id": "tool_call_0",
+                "failed_tool_name": "get_full_reaction_template",
+                "failed_tool_arguments": {"image_path": "/tmp/worker/retry_partial.png"},
+                "conversion_summary": {"converted_bbox_count": 0, "skipped_bbox_count": 1},
+                "tool_warnings": [{"bbox_index": 0, "reason": "edge matrix must be square"}],
+                "plan": [{"id": "tool_call_0", "name": "get_full_reaction_template", "arguments": {"image_path": "/tmp/worker/retry_partial.png"}}],
+                "execution_logs": [
+                    {
+                        "id": "tool_call_0",
+                        "name": "get_full_reaction_template",
+                        "arguments": {"image_path": "/tmp/worker/retry_partial.png"},
+                        "result": {"partial": True, "conversion_summary": {"converted_bbox_count": 0, "skipped_bbox_count": 1}},
+                    }
+                ],
+            }
+
+            with mock.patch.object(service, "_execute_image_pipeline", return_value=(partial_payload, RunMetricsCollector())):
+                status = service.retry_derived_image(derived_image_id)
+
+            self.assertIn("failures=1", status)
+            detail = service.get_run_source_monitor(run_source_id)
+            derived = detail["derived_images"][0]
+            self.assertTrue(derived["raw_artifact_key"])
+            stored_payload = json.loads(store.get_bytes(derived["raw_artifact_key"]).decode("utf-8"))
+            expected_ref = str((artifact_root / artifact_key).resolve())
+            self.assertEqual(stored_payload["image_path"], expected_ref)
+            self.assertEqual(stored_payload["original_image_path"], "/tmp/worker/retry_partial.png")
+            self.assertEqual(stored_payload["failed_tool_name"], "get_full_reaction_template")
+            self.assertEqual(stored_payload["plan"][0]["arguments"]["image_path"], expected_ref)
+            self.assertEqual(stored_payload["execution_logs"][0]["arguments"]["image_path"], expected_ref)
+
     def test_live_image_redo_auto_retries_with_no_agents(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -723,6 +810,83 @@ class ReviewServiceTests(unittest.TestCase):
             self.assertEqual(latest_attempt["failure_kind"], "provider_systemic")
             self.assertEqual(latest_attempt["error_summary"], "Connection error.")
             self.assertEqual(derived["normalization_status"], "none_found")
+
+    def test_dataset_maintenance_rescues_logged_partial_payload_into_raw_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            runtime_root = tmp / "runtime_logs" / "active"
+            repo = ReviewRepository(tmp / "review.sqlite3")
+            artifact_root = tmp / "artifacts"
+            experiment_id = repo.create_experiment(name="exp")
+            run_id = repo.create_run(
+                experiment_id=experiment_id,
+                profile_label="baseline",
+                ingest_mode="live_batch",
+                status="failed",
+                config_snapshot={"ARTIFACT_BACKEND": "filesystem", "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root)},
+                config_hash="hash",
+            )
+            source_asset_id = repo.upsert_source_asset(
+                source_asset_id="source-a",
+                source_type="pdf",
+                sha256="sha-a",
+                original_filename="paper.pdf",
+                artifact_backend="filesystem",
+                artifact_key="sources/source-a/original.pdf",
+                artifact_status="present",
+            )
+            run_source_id = repo.create_run_source(run_id=run_id, source_asset_id=source_asset_id, input_order=0, source_type="pdf")
+            store = create_artifact_store_from_config(
+                {"ARTIFACT_BACKEND": "filesystem", "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root)}
+            )
+            derived_source = tmp / "paper_image_5_1.png"
+            Image.new("RGB", (32, 32), "white").save(derived_source)
+            derived_key = "derived/run-source/5.png"
+            store.put_file(derived_key, str(derived_source), content_type="image/png")
+            derived_image_id = repo.create_derived_image(
+                run_source_id=run_source_id,
+                page_hint="paper_image_5_1.png",
+                image_index=5,
+                artifact_backend="filesystem",
+                artifact_key=derived_key,
+                artifact_status="present",
+                status="failed",
+                outcome_class="failed",
+                raw_artifact_key="",
+                error_text="list index out of range",
+            )
+            attempt = repo.create_derived_image_attempt(
+                derived_image_id=derived_image_id,
+                trigger="initial",
+                execution_mode="normal",
+                status="failed",
+                config_snapshot_json="{}",
+            )
+            repo.update_derived_image_status(derived_image_id, last_attempt_id=str(attempt["attempt_id"]), attempt_count=1)
+
+            partial_payload = {
+                "partial": True,
+                "error": "list index out of range",
+                "traceback": "Traceback...",
+                "image_path": "/tmp/worker/paper_image_5_1.png",
+                "plan": [{"id": "tool_call_0", "name": "get_full_reaction_template", "arguments": {"image_path": "/tmp/worker/paper_image_5_1.png"}}],
+                "execution_logs": [],
+            }
+            active_dir = runtime_root / run_id
+            active_dir.mkdir(parents=True, exist_ok=True)
+            (active_dir / "stdout.log").write_text(repr(partial_payload) + "\n", encoding="utf-8")
+
+            service = ReviewDatasetService(repo)
+            with mock.patch.object(review_service_module, "ACTIVE_RUN_LOG_ROOT", runtime_root):
+                summary = service.run_dataset_maintenance(run_id)
+
+            detail = service.get_run_source_monitor(run_source_id)
+            derived = detail["derived_images"][0]
+            self.assertEqual(summary["rescued_partial_artifacts"], 1)
+            self.assertTrue(derived["raw_artifact_key"])
+            stored_payload = json.loads(store.get_bytes(derived["raw_artifact_key"]).decode("utf-8"))
+            self.assertEqual(stored_payload["original_image_path"], "/tmp/worker/paper_image_5_1.png")
+            self.assertEqual(stored_payload["image_artifact_key"], derived_key)
 
     def test_service_recovers_stale_running_runs_on_startup(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

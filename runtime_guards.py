@@ -20,6 +20,14 @@ class RuntimeStageError(RuntimeError):
         self._runtime_stage = context
 
 
+def attach_runtime_metadata(exc: Exception, **metadata: Any) -> Exception:
+    for key, value in metadata.items():
+        if value in (None, "", [], {}):
+            continue
+        setattr(exc, key, value)
+    return exc
+
+
 def _raise_runtime_error(message: str, *, context: str, retry_trigger: str = "") -> RuntimeStageError:
     raise RuntimeStageError(message, context=context, retry_trigger=retry_trigger)
 
@@ -123,4 +131,3 @@ def safe_json_loads(raw: Any, *, context: str, retry_trigger: str = "", default:
         if default is not None:
             return default
         _raise_runtime_error(f"invalid JSON content: {exc}", context=context, retry_trigger=retry_trigger)
-

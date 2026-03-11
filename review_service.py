@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import hashlib
 import copy
 import json
@@ -21,7 +22,7 @@ from rdkit import Chem
 from llm_preflight import RunFailureController, RunFailureControllerState, classify_provider_exception
 from review_artifacts import ArtifactStore, create_artifact_store_from_config
 from review_db import ReviewRepository
-from review_logging import RunLogSession, bind_log_context, get_log_download_ref, read_log_tail
+from review_logging import ACTIVE_RUN_LOG_ROOT, RunLogSession, bind_log_context, get_log_download_ref, read_log_tail
 from review_renderer import render_reaction_png
 from review_tracking import RunMetricsCollector, bind_metrics_collector
 
@@ -578,6 +579,54 @@ def _artifact_to_local_path(store: ArtifactStore, artifact_key: str, *, suffix: 
     return Path(temp.name).resolve()
 
 
+def _load_run_stream_text(*, run_id: str, config: Dict[str, Any], artifact_key: str, file_name: str) -> str:
+    active_path = ACTIVE_RUN_LOG_ROOT / run_id / file_name
+    if active_path.exists():
+        return active_path.read_text(encoding="utf-8", errors="replace")
+    if not artifact_key:
+        return ""
+    try:
+        store = create_artifact_store_from_config(config)
+        return store.get_bytes(artifact_key).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _extract_partial_payload_lines(log_text: str) -> List[Dict[str, Any]]:
+    payloads: List[Dict[str, Any]] = []
+    for raw_line in log_text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{'partial': True"):
+            continue
+        try:
+            payload = ast.literal_eval(line)
+        except (SyntaxError, ValueError):
+            continue
+        if isinstance(payload, dict) and payload.get("partial") is True:
+            payloads.append(payload)
+    return payloads
+
+
+def _matching_partial_payload(
+    payloads: Sequence[Dict[str, Any]],
+    *,
+    page_hint: str,
+    original_filename: str,
+) -> Optional[Dict[str, Any]]:
+    candidates = {
+        Path(page_hint).name.strip(),
+        Path(original_filename).name.strip(),
+    }
+    candidates.discard("")
+    if not candidates:
+        return None
+    for payload in reversed(payloads):
+        raw_path = str(payload.get("original_image_path") or payload.get("image_path") or "").strip()
+        if Path(raw_path).name.strip() in candidates:
+            return payload
+    return None
+
+
 def _initial_summary(total_sources: int = 0) -> Dict[str, Any]:
     return {
         "total_sources": total_sources,
@@ -1034,6 +1083,69 @@ class ReviewDatasetService:
     def list_retry_candidates(self, run_id: str) -> List[Dict[str, Any]]:
         return self.repository.list_retry_candidates(run_id)
 
+    def _rescue_partial_payload_artifact(
+        self,
+        *,
+        run: Dict[str, Any],
+        source_detail: Dict[str, Any],
+        derived_detail: Dict[str, Any],
+        config_snapshot: Dict[str, Any],
+    ) -> bool:
+        attempts = list(derived_detail.get("attempts", []) or [])
+        if not attempts:
+            return False
+        latest_attempt = attempts[-1]
+        if str(latest_attempt.get("raw_artifact_key") or ""):
+            return False
+        if str(latest_attempt.get("status") or "") not in {"completed", "failed", "aborted"}:
+            return False
+        run_id = str(run.get("run_id") or "")
+        stdout_text = _load_run_stream_text(
+            run_id=run_id,
+            config=config_snapshot,
+            artifact_key=str(run.get("stdout_artifact_key") or ""),
+            file_name="stdout.log",
+        )
+        payload = _matching_partial_payload(
+            _extract_partial_payload_lines(stdout_text),
+            page_hint=str(derived_detail.get("page_hint") or ""),
+            original_filename=str(source_detail.get("original_filename") or ""),
+        )
+        if not payload:
+            return False
+        store = create_artifact_store_from_config(config_snapshot)
+        raw_key = (
+            f"raw/{run_id}/{derived_detail['run_source_id']}/"
+            f"image_{int(derived_detail.get('image_index', 0))}_attempt_{int(latest_attempt.get('attempt_no', 0) or 0)}.json"
+        )
+        rewritten_payload = _rewrite_payload_image_refs(
+            payload,
+            store=store,
+            artifact_key=str(derived_detail.get("artifact_key") or ""),
+            artifact_backend=str(derived_detail.get("artifact_backend") or store.backend_name),
+        )
+        _store_json(store, raw_key, rewritten_payload)
+        error_summary = str(rewritten_payload.get("error") or latest_attempt.get("error_summary") or "")
+        failure_kind = _stable_failure_category(
+            failure_kind=str(latest_attempt.get("failure_kind") or ""),
+            error_summary=error_summary,
+            normalization_status=str(derived_detail.get("normalization_status") or ""),
+            normalization_summary=str(derived_detail.get("normalization_summary") or ""),
+            outcome_class=str(derived_detail.get("outcome_class") or ""),
+        )
+        self.repository.update_derived_image_attempt(
+            str(latest_attempt["attempt_id"]),
+            raw_artifact_key=raw_key,
+            error_summary=error_summary,
+            failure_kind=failure_kind or None,
+        )
+        self.repository.update_derived_image_status(
+            str(derived_detail["derived_image_id"]),
+            raw_artifact_key=raw_key,
+            error_text=error_summary,
+        )
+        return True
+
     def _ensure_attempt_history(
         self,
         *,
@@ -1313,6 +1425,7 @@ class ReviewDatasetService:
             "seeded_attempts": 0,
             "repaired_attempts": 0,
             "normalized_terminal_rows": 0,
+            "rescued_partial_artifacts": 0,
             "reprocessed_derived_images": 0,
             "accepted_reactions": 0,
         }
@@ -1332,6 +1445,14 @@ class ReviewDatasetService:
                         detail=derived,
                         config_snapshot=config_snapshot,
                     )
+                    if self._rescue_partial_payload_artifact(
+                        run=run or {"run_id": current_run_id},
+                        source_detail=detail,
+                        derived_detail=repaired,
+                        config_snapshot=config_snapshot,
+                    ):
+                        summary["rescued_partial_artifacts"] += 1
+                        repaired = self.repository.get_derived_image(str(derived["derived_image_id"]))
                     after_attempts = list(repaired.get("attempts", []) or [])
                     if len(after_attempts) > before_attempt_count:
                         summary["seeded_attempts"] += 1
@@ -2336,6 +2457,7 @@ class ReviewDatasetService:
                     outcome_class = _classify_payload(payload)
                     metrics_summary = metrics.summary()
                     attempt_failure_kind = _stable_failure_category(
+                        error_summary=str(payload.get("error") or ""),
                         normalization_status=normalization.normalization_status,
                         normalization_summary=normalization.normalization_summary,
                         outcome_class=outcome_class,

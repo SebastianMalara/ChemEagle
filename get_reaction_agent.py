@@ -391,9 +391,11 @@ def get_reaction_withatoms(image_path: str) -> dict:
                     if 'coords' in item and 'edges' in item:
                         coords = item['coords']
                         edges = item['edges']
-                        new_smiles, new_molfile, _ = conversion_function(coords, updated_symbols, edges)
-                        
-                        # 替换旧的 smiles 和 molfile
+                        try:
+                            new_smiles, new_molfile, _ = conversion_function(coords, updated_symbols, edges)
+                        except Exception as exc:
+                            print(f"warning: reaction graph conversion skipped for bbox {bbox}: {exc}")
+                            continue
                         item['smiles'] = new_smiles
                         item['molfile'] = new_molfile
 
@@ -634,9 +636,11 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
                     if 'coords' in item and 'edges' in item:
                         coords = item['coords']
                         edges = item['edges']
-                        new_smiles, new_molfile, _ = conversion_function(coords, updated_symbols, edges)
-                        
-                        # 替换旧的 smiles 和 molfile
+                        try:
+                            new_smiles, new_molfile, _ = conversion_function(coords, updated_symbols, edges)
+                        except Exception as exc:
+                            print(f"warning: reaction graph conversion skipped for bbox {bbox}: {exc}")
+                            continue
                         item['smiles'] = new_smiles
                         item['molfile'] = new_molfile
 
@@ -884,9 +888,11 @@ def get_reaction_withatoms_correctR_OS(
                     if 'coords' in item and 'edges' in item:
                         coords = item['coords']
                         edges = item['edges']
-                        new_smiles, new_molfile, _ = conversion_function(coords, updated_symbols, edges)
-                        
-                        # 替换旧的 smiles 和 molfile
+                        try:
+                            new_smiles, new_molfile, _ = conversion_function(coords, updated_symbols, edges)
+                        except Exception as exc:
+                            print(f"warning: reaction graph conversion skipped for bbox {bbox}: {exc}")
+                            continue
                         item['smiles'] = new_smiles
                         item['molfile'] = new_molfile
 

@@ -14,7 +14,7 @@ import json
 import base64
 import re
 import traceback
-from typing import Optional
+from typing import Any, Optional
 from asset_registry import build_asset_preflight_report
 from get_molecular_agent import process_reaction_image_with_multiple_products_and_text_correctR, process_reaction_image_with_multiple_products_and_text_correctmultiR
 from get_reaction_agent import get_reaction_withatoms_correctR
@@ -121,7 +121,7 @@ def _partial_failure_payload(
     plan_to_execute: Optional[list],
     execution_logs: list,
 ) -> dict:
-    return {
+    payload = {
         "partial": True,
         "error": str(exc),
         "traceback": traceback.format_exc(),
@@ -129,6 +129,38 @@ def _partial_failure_payload(
         "plan": plan_to_execute or [],
         "execution_logs": execution_logs,
     }
+    failed_tool_id = str(getattr(exc, "_failed_tool_id", "") or "")
+    failed_tool_name = str(getattr(exc, "_failed_tool_name", "") or "")
+    failed_tool_arguments = getattr(exc, "_failed_tool_arguments", None)
+    tool_warnings = getattr(exc, "_tool_warnings", None)
+    conversion_summary = getattr(exc, "_conversion_summary", None)
+    if failed_tool_id:
+        payload["failed_tool_id"] = failed_tool_id
+    if failed_tool_name:
+        payload["failed_tool_name"] = failed_tool_name
+    if failed_tool_arguments:
+        payload["failed_tool_arguments"] = failed_tool_arguments
+    if tool_warnings:
+        payload["tool_warnings"] = tool_warnings
+    if conversion_summary:
+        payload["conversion_summary"] = conversion_summary
+    return payload
+
+
+def _partial_tool_result_for_exception(exc: Exception) -> Optional[dict[str, Any]]:
+    partial_result = getattr(exc, "_partial_result", None)
+    if isinstance(partial_result, dict):
+        return partial_result
+    tool_warnings = getattr(exc, "_tool_warnings", None)
+    conversion_summary = getattr(exc, "_conversion_summary", None)
+    if not tool_warnings and not conversion_summary:
+        return None
+    result: dict[str, Any] = {"partial": True}
+    if tool_warnings:
+        result["tool_warnings"] = tool_warnings
+    if conversion_summary:
+        result["conversion_summary"] = conversion_summary
+    return result
 
 
 def ChemEagle(
@@ -370,6 +402,17 @@ def ChemEagle(
                     tool_result = _tool_unavailable_payload(tool_name, tool_args, exc)
                     tool_result["asset_preflight"] = tool_preflight
                 else:
+                    setattr(exc, "_failed_tool_id", tool_call_id)
+                    setattr(exc, "_failed_tool_name", tool_name)
+                    setattr(exc, "_failed_tool_arguments", tool_args)
+                    partial_tool_result = _partial_tool_result_for_exception(exc)
+                    if partial_tool_result is not None:
+                        execution_logs.append({
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "arguments": tool_args,
+                            "result": partial_tool_result,
+                        })
                     raise
 
             execution_logs.append({
@@ -598,6 +641,17 @@ def ChemEagle_OS(
                     tool_result = _tool_unavailable_payload(tool_name, tool_args, exc)
                     tool_result["asset_preflight"] = tool_preflight
                 else:
+                    setattr(exc, "_failed_tool_id", tool_call_id)
+                    setattr(exc, "_failed_tool_name", tool_name)
+                    setattr(exc, "_failed_tool_arguments", tool_args)
+                    partial_tool_result = _partial_tool_result_for_exception(exc)
+                    if partial_tool_result is not None:
+                        execution_logs.append({
+                            "id": tool_call_id,
+                            "name": tool_name,
+                            "arguments": tool_args,
+                            "result": partial_tool_result,
+                        })
                     raise
 
             execution_logs.append({
