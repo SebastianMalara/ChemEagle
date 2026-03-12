@@ -77,6 +77,13 @@ export function RunsView() {
   const progressSummary =
     monitorResource.data?.progress.status_summary ||
     (selectedRun ? "Polling run status." : "Select a run to start monitoring.");
+  const reactionCount = (runsResource.data || []).reduce(
+    (total, run) => total + Number(run.total_reactions || 0),
+    0,
+  );
+  const reviewableRunCount = (runsResource.data || []).filter(
+    (run) => Number(run.total_reactions || 0) > 0,
+  ).length;
 
   async function runAction(action: () => Promise<{ message?: string }>, fallback: string) {
     const response = await action();
@@ -94,12 +101,12 @@ export function RunsView() {
         </div>
         <div className="hero-stats">
           <div className="stat-card">
-            <span className="stat-label">Experiments</span>
-            <strong className="stat-value">{experimentsResource.data?.length || 0}</strong>
+            <span className="stat-label">Reactions</span>
+            <strong className="stat-value">{reactionCount}</strong>
           </div>
           <div className="stat-card">
             <span className="stat-label">Runs</span>
-            <strong className="stat-value">{runsResource.data?.length || 0}</strong>
+            <strong className="stat-value">{reviewableRunCount}</strong>
           </div>
           <div className="stat-card">
             <span className="stat-label">Selection</span>

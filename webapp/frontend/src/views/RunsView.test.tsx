@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../api/client";
 import { useAsyncResource, usePollingResource } from "../api/hooks";
@@ -56,7 +56,13 @@ describe("RunsView", () => {
   it("keeps the run tail hidden until explicitly opened", async () => {
     render(<RunsView />);
 
+    const runStatLabel = screen
+      .getAllByText("Runs")
+      .find((node) => node.classList.contains("stat-label"));
+
     expect(screen.getByText("Source queue").closest("section")).toHaveClass("batch-pane");
+    expect(within(screen.getByText("Reactions").closest(".stat-card")!).getByText("48")).toBeInTheDocument();
+    expect(within(runStatLabel?.closest(".stat-card")!).getByText("1")).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "Open log" })).toBeInTheDocument();
     expect(screen.queryByText(/\[INFO] Extracting scheme_014\.pdf/)).not.toBeInTheDocument();
 
