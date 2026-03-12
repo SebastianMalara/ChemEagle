@@ -1,6 +1,10 @@
 import sys
 import torch
 import json
+from hf_runtime import configure_transformers_runtime
+
+configure_transformers_runtime()
+
 from chemietoolkit import ChemIEToolkit,utils
 import cv2
 from openai import OpenAI
@@ -432,9 +436,15 @@ def ChemEagle(
                 }),
             })
 
-        if use_action_observer and action_observer_agent(image_path, execution_logs):
+        if use_action_observer:
+            observer_verdict = action_observer_agent(image_path, execution_logs)
+        else:
+            observer_verdict = None
+
+        if isinstance(observer_verdict, dict) and observer_verdict.get("redo"):
             return {
                 "redo": True,
+                "observer_verdict": observer_verdict,
                 "plan": plan_to_execute,
                 "execution_logs": execution_logs,
             }
@@ -677,9 +687,15 @@ def ChemEagle_OS(
         
         print(f'[OS_D] results: {results}')
         
-        if use_action_observer and action_observer_agent_OS(image_path, execution_logs):
+        if use_action_observer:
+            observer_verdict = action_observer_agent_OS(image_path, execution_logs)
+        else:
+            observer_verdict = None
+
+        if isinstance(observer_verdict, dict) and observer_verdict.get("redo"):
             return {
                 "redo": True,
+                "observer_verdict": observer_verdict,
                 "plan": plan_to_execute,
                 "execution_logs": execution_logs,
             }

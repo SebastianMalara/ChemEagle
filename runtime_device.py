@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import os
 
-import torch
-
 _WARNED_MESSAGES: set[str] = set()
 
 
-def resolve_torch_device() -> torch.device:
+def _load_torch():
+    import torch
+
+    return torch
+
+
+def resolve_torch_device():
+    torch = _load_torch()
     pref = os.getenv("CHEMEAGLE_DEVICE", "auto").strip().lower()
     mps_available = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
 
@@ -32,8 +37,8 @@ def resolve_torch_device() -> torch.device:
     return torch.device("cpu")
 
 
-def easyocr_uses_acceleration(device: torch.device) -> bool:
-    return device.type in {"cuda", "mps"}
+def easyocr_uses_acceleration(device) -> bool:
+    return getattr(device, "type", "") in {"cuda", "mps"}
 
 
 def resolve_ocr_backend(

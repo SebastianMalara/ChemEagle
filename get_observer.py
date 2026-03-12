@@ -2,7 +2,7 @@ import base64
 import json
 import os
 import time
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
 from openai import InternalServerError, RateLimitError, APIError
@@ -58,24 +58,93 @@ Current plan (JSON):
 {plan_json}
 """
 
-ACTION_PROMPT_TEMPLATE = """System Message: 
-You are an action observer. Your task is too observe the graphic and the current agent output, decide whether the agent must be rerun.
+ACTION_PROMPT_TEMPLATE = """System Message:
+You are an action observer for a chemistry extraction pipeline.
+Decide whether the current extraction should be rerun only when there is an objective extraction failure that makes the current output unusable.
 
-User Message: 
-By observing the image and the current agent output, decide whether the agent must be rerun.
-The main focus is on whether the SMILES is reasonable and effective. Is the condition or text classification correct?
-If the outcome is acceptable, return redo=false.
-If issues are found or corrections are needed, return redo=true with a short explanation.
+User Message:
+Inspect the image and the current tool outputs.
+Only request redo=true when at least one of these objective issues is present:
+- no_reaction_detected: the result contains no extracted reaction at all
+- tool_output_empty: the relevant tool output is empty or missing required content
+- missing_core_structure: the extracted reaction is missing the core reactant or product structure
+- malformed_result_shape: the output shape is malformed and cannot be normalized reliably
+
+If the output has chemistry-quality concerns but is still usable, keep redo=false and explain the warning in reason.
+Do not request redo for broad plausibility concerns alone.
 
 Always respond in valid JSON with the structure:
 {{
   "redo": true/false,
-  "reason": "Provide the reasons when redo is true; otherwise leave blank."
+  "reason": "Short explanation",
+  "issue_codes": ["zero or more issue codes from the allowed list"],
+  "confidence": 0.0
 }}
 
 Current agent_result (JSON):
 {result_json}
 """
+
+ACTION_REDO_ISSUE_CODES = {
+    "no_reaction_detected",
+    "tool_output_empty",
+    "missing_core_structure",
+    "malformed_result_shape",
+}
+
+
+def _default_action_observer_verdict(reason: str = "") -> Dict[str, Any]:
+    return {
+        "redo": False,
+        "reason": reason,
+        "issue_codes": [],
+        "confidence": 0.0,
+    }
+
+
+def _normalize_issue_codes(value: Any) -> List[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = []
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        code = item.strip().lower()
+        if not code:
+            continue
+        if code not in seen:
+            normalized.append(code)
+            seen.add(code)
+    return normalized
+
+
+def _normalize_action_observer_verdict(parsed: Any, *, default_reason: str = "") -> Dict[str, Any]:
+    if isinstance(parsed, bool):
+        verdict = _default_action_observer_verdict(default_reason)
+        verdict["redo"] = parsed
+        return verdict
+    if not isinstance(parsed, dict):
+        return _default_action_observer_verdict(default_reason)
+
+    verdict = _default_action_observer_verdict(str(parsed.get("reason") or default_reason or ""))
+    verdict["redo"] = bool(parsed.get("redo", False))
+    verdict["issue_codes"] = _normalize_issue_codes(parsed.get("issue_codes"))
+    confidence = parsed.get("confidence", 0.0)
+    try:
+        verdict["confidence"] = max(0.0, min(1.0, float(confidence)))
+    except (TypeError, ValueError):
+        verdict["confidence"] = 0.0
+    if verdict["redo"] and not verdict["issue_codes"]:
+        lowered_reason = verdict["reason"].lower()
+        for code in ACTION_REDO_ISSUE_CODES:
+            if code in lowered_reason:
+                verdict["issue_codes"].append(code)
+    return verdict
 
 
 def _encode_image(image_path: str) -> str | None:
@@ -120,7 +189,7 @@ def plan_observer_agent(image_path: str, tool_calls: List[Any]) -> List[Any]:
         return tool_calls
 
 
-def action_observer_agent(image_path: str, tool_result: Any) -> bool:
+def action_observer_agent(image_path: str, tool_result: Any) -> Dict[str, Any]:
     base64_image = _encode_image(image_path)
     result_json = json.dumps(tool_result, ensure_ascii=False, indent=2)
     prompt = ACTION_PROMPT_TEMPLATE.format(result_json=result_json)
@@ -137,8 +206,8 @@ def action_observer_agent(image_path: str, tool_result: Any) -> bool:
     try:
         client = _get_client()
         if client is None:
-            # 没有 API 配置，返回 False（不重做）
-            return False
+            # 没有 API 配置，返回“不重做”
+            return _default_action_observer_verdict("observer client unavailable")
         
         content = client.chat_completion_text(
             model=os.getenv("LLM_MODEL", "gpt-5-mini"),
@@ -149,9 +218,9 @@ def action_observer_agent(image_path: str, tool_result: Any) -> bool:
             ],
         )
         parsed = json.loads(content)
-        return bool(parsed.get("redo", False))
-    except Exception:
-        return False
+        return _normalize_action_observer_verdict(parsed)
+    except Exception as exc:
+        return _default_action_observer_verdict(str(exc))
 
 
 def retry_api_call(func, max_retries=3, base_delay=2, backoff_factor=2, *args, **kwargs):
@@ -292,7 +361,7 @@ def action_observer_agent_OS(
     model_name: str = "/models/Qwen3-VL-32B-Instruct-AWQ",
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
-) -> bool:
+) -> Dict[str, Any]:
     """
     OS 版本的 action_observer_agent，使用兼容 OpenAI Chat Completions 协议的本地/自建模型。
 
@@ -304,7 +373,7 @@ def action_observer_agent_OS(
         api_key: 接口密钥，可为任意非空字符串（vLLM 默认可填 `"EMPTY"`）
 
     Returns:
-        bool: 是否需要重新执行（True 表示需要重做）
+        Dict[str, Any]: 结构化 verdict，包含 redo / reason / issue_codes / confidence。
     """
     base_url = base_url or os.getenv("VLLM_BASE_URL", os.getenv("OLLAMA_BASE_URL", "http://localhost:8000/v1"))
     api_key = api_key or os.getenv("VLLM_API_KEY", os.getenv("OLLAMA_API_KEY", "EMPTY"))
@@ -343,7 +412,7 @@ def action_observer_agent_OS(
         )
         content = message_content(response, context="action_observer_os", default="")
         if not content:
-            return False
+            return _default_action_observer_verdict("empty observer response")
         
         # Try to parse JSON directly
         try:
@@ -357,9 +426,9 @@ def action_observer_agent_OS(
                     raise ValueError("Failed to extract JSON from response")
             except (ImportError, ValueError):
                 print(f"⚠️ 警告: action_observer_agent_OS 无法解析 JSON，返回 False（不重做）")
-                return False
-        
-        return bool(parsed.get("redo", False))
+                return _default_action_observer_verdict("malformed observer response")
+
+        return _normalize_action_observer_verdict(parsed)
     except Exception as e:
         print(f"⚠️ 警告: action_observer_agent_OS 出错: {e}，返回 False（不重做）")
-        return False
+        return _default_action_observer_verdict(str(e))

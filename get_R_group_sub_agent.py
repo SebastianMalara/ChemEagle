@@ -32,6 +32,7 @@ from runtime_guards import (
     RuntimeStageError,
     assistant_message as guarded_assistant_message,
     first_dict_item,
+    first_item,
     first_tool_call,
     message_content,
     safe_json_loads,
@@ -106,6 +107,37 @@ def _extract_valid_coref_entries(bboxes, group):
         if isinstance(raw_idx, int) and 0 <= raw_idx < len(bboxes):
             valid_entries.append((raw_idx, bboxes[raw_idx]))
     return valid_entries
+
+
+def _empty_reaction_sections() -> dict:
+    return {
+        "reactants": [],
+        "conditions": [],
+        "products": [],
+    }
+
+
+def _first_raw_prediction_or_empty(raw_results, *, context: str) -> dict:
+    if isinstance(raw_results, dict):
+        return raw_results
+    raw_root = first_item(raw_results, context=context, default=None)
+    if isinstance(raw_root, dict):
+        return raw_root
+    print(f"warning: {context}: empty result list")
+    return _empty_reaction_sections()
+
+
+def _wrap_reaction_results(raw_results, *, context: str) -> list[dict]:
+    reaction_root = _first_raw_prediction_or_empty(raw_results, context=context)
+    if not any(reaction_root.values()):
+        return [{"reactions": []}]
+    return [{
+        "reactions": [{
+            "reactants": reaction_root.get("reactants", []),
+            "conditions": reaction_root.get("conditions", []),
+            "products": reaction_root.get("products", []),
+        }]
+    }]
 
 def normalize_product_variant_output(data: dict) -> dict:
    
@@ -686,7 +718,9 @@ def get_reaction_from_raw(raw_pred: dict) -> dict:
     """
     Returns a structured dictionary of reactions extracted from the raw prediction,
     """
-    structured = {}
+    structured = _empty_reaction_sections()
+    if not isinstance(raw_pred, dict):
+        return structured
     for section in ['reactants', 'conditions', 'products']:
         if section in raw_pred:
             structured[section] = []
@@ -712,10 +746,9 @@ def get_reaction(image_path: str) -> dict:
     Returns a structured dictionary of reactions extracted from the image,
     """
     # 复用缓存的 raw_results
-    raw_pred = first_dict_item(
+    raw_pred = _first_raw_prediction_or_empty(
         get_cached_raw_results(image_path),
         context="r_group_agent.get_reaction",
-        retry_trigger="auto_recovery_retry",
     )
     return get_reaction_from_raw(raw_pred)
 
@@ -739,10 +772,9 @@ def get_reaction_OS(image_path: str) -> dict:
     Returns a structured dictionary of reactions extracted from the image,
     """
     # 复用缓存的 raw_results
-    raw_pred = first_dict_item(
+    raw_pred = _first_raw_prediction_or_empty(
         get_cached_raw_results_OS(image_path),
         context="r_group_agent.get_reaction_os",
-        retry_trigger="auto_recovery_retry",
     )
     return get_reaction_from_raw(raw_pred)
 
@@ -1166,15 +1198,11 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
 
     # reaction_results = model.extract_reactions_from_figures([image_np])
     #reaction_results = get_reaction_withatoms_correctR(image_path)[0]
-    raw_results  = get_cached_raw_results(image_path)
-    reaction_results = first_dict_item(raw_results, context="r_group_agent.product_variant.raw_results", retry_trigger="auto_recovery_retry")
-    
-    reaction = {
-    "reactants": reaction_results.get('reactants', []),
-    "conditions": reaction_results.get('conditions', []),
-    "products": reaction_results.get('products', [])
-    }
-    reaction_results = [{"reactions": [reaction]}]
+    raw_results = get_cached_raw_results(image_path)
+    reaction_results = _wrap_reaction_results(
+        raw_results,
+        context="r_group_agent.product_variant.raw_results",
+    )
     #print(reaction_results)
     
 
@@ -1204,7 +1232,16 @@ def process_reaction_image_with_product_variant_R_group(image_path: str) -> dict
     reactants_array = []
     products = []
 
-    first_reaction = first_dict_item(reaction_results.get('reactions', []), context="r_group_agent.product_variant.reactions", retry_trigger="auto_recovery_retry")
+    reaction_container = first_item(
+        reaction_results,
+        context="r_group_agent.product_variant.container",
+        default={"reactions": []},
+    ) or {"reactions": []}
+    first_reaction = first_item(
+        reaction_container.get('reactions', []),
+        context="r_group_agent.product_variant.reactions",
+        default=None,
+    ) or _empty_reaction_sections()
     for reactant in first_reaction.get('reactants', []):
         if 'smiles' in reactant:
             #print(f"SMILES:{reactant['smiles']}")
@@ -1483,14 +1520,10 @@ def process_reaction_image_with_product_variant_R_group_OS(
     # 使用 OS 版本的缓存函数
     coref_results = get_cached_multi_molecular_OS(image_path)
     raw_results = get_cached_raw_results_OS(image_path)
-    reaction_results = first_dict_item(raw_results, context="r_group_agent.product_variant_os.raw_results", retry_trigger="auto_recovery_retry")
-    
-    reaction = {
-        "reactants": reaction_results.get('reactants', []),
-        "conditions": reaction_results.get('conditions', []),
-        "products": reaction_results.get('products', [])
-    }
-    reaction_results = [{"reactions": [reaction]}]
+    reaction_results = _wrap_reaction_results(
+        raw_results,
+        context="r_group_agent.product_variant_os.raw_results",
+    )
 
     # 定义更新工具输出的函数
     def extract_smiles_details(smiles_data, raw_details):
@@ -1517,7 +1550,16 @@ def process_reaction_image_with_product_variant_R_group_OS(
     reactants_array = []
     products = []
 
-    first_reaction = first_dict_item(reaction_results.get('reactions', []), context="r_group_agent.product_variant_os.reactions", retry_trigger="auto_recovery_retry")
+    reaction_container = first_item(
+        reaction_results,
+        context="r_group_agent.product_variant_os.container",
+        default={"reactions": []},
+    ) or {"reactions": []}
+    first_reaction = first_item(
+        reaction_container.get('reactions', []),
+        context="r_group_agent.product_variant_os.reactions",
+        default=None,
+    ) or _empty_reaction_sections()
     for reactant in first_reaction.get('reactants', []):
         if 'smiles' in reactant:
             reactants_array.append(reactant['smiles'])

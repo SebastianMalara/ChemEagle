@@ -34,5 +34,6 @@ safetensors
 einops
 chemrxnextractor @ git+https://github.com/CrystalEye42/ChemRxnExtractor.git@0f9529dbe3656e4ef5ea96c5b5ba990f7481700b
 anthropic
+decimer
 
 gradio>=4.44.0

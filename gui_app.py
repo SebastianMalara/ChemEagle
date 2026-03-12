@@ -17,6 +17,7 @@ except ImportError as e:
     raise ImportError("gradio is required for gui_app.py. Install dependencies with: pip install -r requirements.txt") from e
 
 from asset_registry import ASSET_ENV_VAR, build_asset_preflight_report
+from hf_runtime import configure_transformers_runtime
 from llm_preflight import collect_runtime_provider_preflight
 from llm_profiles import MANUAL_MODEL_LIST_PROVIDERS, list_available_models, resolve_llm_profile
 from review_artifacts import create_artifact_store_from_config
@@ -30,6 +31,7 @@ ENV_FILE_DEFAULT = Path(".env.chemeagle")
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 LLM_PROVIDER_CHOICES = ["azure", "openai", "openai_compatible", "lmstudio", "local_openai", "anthropic"]
 OCR_BACKEND_CHOICES = ["auto", "llm_vision", "easyocr", "tesseract"]
+MOLECULE_SMILES_RESCUE_CHOICES = ["off", "decimer"]
 PDF_MODEL_CHOICES = ["base", "large"]
 ENV_KEYS = [
     "CHEMEAGLE_RUN_MODE",
@@ -51,6 +53,8 @@ ENV_KEYS = [
     "OCR_VLLM_API_KEY",
     "OCR_LANG",
     "OCR_CONFIG",
+    "MOLECULE_SMILES_RESCUE",
+    "MOLECULE_SMILES_RESCUE_CONFIDENCE",
     "TESSERACT_CMD",
     "PDF_MODEL_SIZE",
     "PDF_PERSIST_IMAGES",
@@ -142,6 +146,7 @@ def apply_runtime_env(values: Dict[str, str]) -> None:
             os.environ[key] = value
         else:
             os.environ.pop(key, None)
+    configure_transformers_runtime()
 
     pref = (values.get("CHEMEAGLE_DEVICE") or "").strip().lower()
     if pref in {"auto", "cuda"} and not os.getenv("PYTORCH_CUDA_ALLOC_CONF"):
@@ -176,6 +181,8 @@ def build_runtime_values(
     ocr_lang: str,
     ocr_config: str,
     tesseract_cmd: str,
+    molecule_smiles_rescue: str,
+    molecule_smiles_rescue_confidence: str,
     pdf_model_size: str,
     pdf_persist_images: bool,
     pdf_persist_dir: str,
@@ -208,6 +215,8 @@ def build_runtime_values(
         "OCR_VLLM_API_KEY": ocr_vllm_api_key,
         "OCR_LANG": ocr_lang,
         "OCR_CONFIG": ocr_config,
+        "MOLECULE_SMILES_RESCUE": molecule_smiles_rescue,
+        "MOLECULE_SMILES_RESCUE_CONFIDENCE": molecule_smiles_rescue_confidence,
         "TESSERACT_CMD": tesseract_cmd,
         "PDF_MODEL_SIZE": pdf_model_size,
         "PDF_PERSIST_IMAGES": "1" if pdf_persist_images else "0",
@@ -278,6 +287,8 @@ def _build_dataset_runtime_values(
     ocr_lang: str,
     ocr_config: str,
     tesseract_cmd: str,
+    molecule_smiles_rescue: str,
+    molecule_smiles_rescue_confidence: str,
     pdf_model_size: str,
     pdf_persist_images: bool,
     pdf_persist_dir: str,
@@ -320,6 +331,8 @@ def _build_dataset_runtime_values(
         ocr_lang,
         ocr_config,
         tesseract_cmd,
+        molecule_smiles_rescue,
+        molecule_smiles_rescue_confidence,
         pdf_model_size,
         pdf_persist_images,
         pdf_persist_dir,
@@ -796,6 +809,8 @@ def _build_values_from_form(
     ocr_lang: str,
     ocr_config: str,
     tesseract_cmd: str,
+    molecule_smiles_rescue: str,
+    molecule_smiles_rescue_confidence: str,
     pdf_model_size: str,
     pdf_persist_images: bool,
     pdf_persist_dir: str,
@@ -828,6 +843,8 @@ def _build_values_from_form(
         ocr_lang,
         ocr_config,
         tesseract_cmd,
+        molecule_smiles_rescue,
+        molecule_smiles_rescue_confidence,
         pdf_model_size,
         pdf_persist_images,
         pdf_persist_dir,
@@ -968,14 +985,31 @@ def _render_progress_monitor(monitor: Dict[str, Any]) -> str:
 
 
 def _probe_python_code(code: str, env: Dict[str, str]) -> Dict[str, Any]:
-    proc = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(Path(__file__).resolve().parent),
-        check=False,
-    )
+    timeout_seconds = max(1.0, float(os.getenv("CHEMEAGLE_PREFLIGHT_PROBE_TIMEOUT_SECONDS", "15")))
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(Path(__file__).resolve().parent),
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        timeout_message = f"Probe timed out after {timeout_seconds:.1f}s."
+        if stderr:
+            stderr = f"{stderr}\n{timeout_message}".strip()
+        else:
+            stderr = timeout_message
+        return {
+            "ok": False,
+            "returncode": None,
+            "stdout": _trim_text(stdout),
+            "stderr": _trim_text(stderr),
+        }
     return {
         "ok": proc.returncode == 0,
         "returncode": proc.returncode,
@@ -1112,6 +1146,114 @@ def _ocr_preflight(mode: str, values: Dict[str, str]) -> Dict[str, Any]:
 
     if requested_backend == "auto":
         checks["auto_resolution_rule"] = f"{mode} -> {resolved_backend}"
+
+    return {
+        "blocking_errors": blocking_errors,
+        "warnings": warnings,
+        "checks": checks,
+    }
+
+
+def _torch_runtime_preflight(
+    mode: str,
+    resolved_ocr_backend: str,
+    *,
+    include_pdf_section: bool,
+    values: Dict[str, str],
+) -> Dict[str, Any]:
+    requires_torch = (
+        mode == "local_os"
+        or resolved_ocr_backend == "easyocr"
+        or include_pdf_section
+    )
+    checks: Dict[str, Any] = {
+        "device_preference": values.get("CHEMEAGLE_DEVICE") or "auto",
+        "required_for_current_run": requires_torch,
+        "mode": mode,
+        "resolved_ocr_backend": resolved_ocr_backend,
+        "include_pdf_section": include_pdf_section,
+    }
+    blocking_errors: List[str] = []
+    warnings: List[str] = []
+    env = dict(os.environ)
+    checks["python_import_probe"] = _probe_python_code(
+        "import torch\nprint(getattr(torch, '__version__', 'unknown'))",
+        env,
+    )
+    if not checks["python_import_probe"]["ok"]:
+        message = (
+            "PyTorch failed to import. Local model execution will fail. "
+            "See diagnostics.torch_runtime_preflight.checks.python_import_probe."
+        )
+        if requires_torch:
+            blocking_errors.append(message)
+        else:
+            warnings.append(message)
+    return {
+        "blocking_errors": blocking_errors,
+        "warnings": warnings,
+        "checks": checks,
+    }
+
+
+def _molecule_smiles_rescue_preflight(values: Dict[str, str]) -> Dict[str, Any]:
+    requested_rescue = (values.get("MOLECULE_SMILES_RESCUE") or "off").strip().lower()
+    raw_confidence = (values.get("MOLECULE_SMILES_RESCUE_CONFIDENCE") or "0.85").strip()
+    checks: Dict[str, Any] = {
+        "requested_rescue": requested_rescue,
+        "raw_confidence_threshold": raw_confidence,
+        "python_executable": sys.executable,
+    }
+    blocking_errors: List[str] = []
+    warnings: List[str] = [
+        "DECIMER rescue in this branch applies only to direct molecule extraction, not RxnIM reaction/coreference flows."
+    ]
+
+    if requested_rescue not in {"off", "decimer"}:
+        blocking_errors.append(
+            "MOLECULE_SMILES_RESCUE must be one of: off, decimer."
+        )
+        return {
+            "blocking_errors": blocking_errors,
+            "warnings": warnings,
+            "checks": checks,
+        }
+
+    try:
+        confidence_threshold = float(raw_confidence)
+    except ValueError:
+        blocking_errors.append("MOLECULE_SMILES_RESCUE_CONFIDENCE must be a float between 0 and 1.")
+        return {
+            "blocking_errors": blocking_errors,
+            "warnings": warnings,
+            "checks": checks,
+        }
+
+    checks["confidence_threshold"] = confidence_threshold
+    if not 0.0 <= confidence_threshold <= 1.0:
+        blocking_errors.append("MOLECULE_SMILES_RESCUE_CONFIDENCE must be a float between 0 and 1.")
+
+    if requested_rescue == "decimer":
+        env = dict(os.environ)
+        probe_lines = [
+            "import importlib.util, json",
+            "decimer_spec = importlib.util.find_spec('DECIMER')",
+            "shim_spec = importlib.util.find_spec('decimer')",
+            "if decimer_spec is None and shim_spec is None:",
+            "    raise ModuleNotFoundError(\"No module named 'DECIMER' or 'decimer'\")",
+            "print(json.dumps({",
+            "    'DECIMER': getattr(decimer_spec, 'origin', None),",
+            "    'decimer': getattr(shim_spec, 'origin', None),",
+            "}))",
+        ]
+        checks["python_import_probe"] = _probe_python_code("\n".join(probe_lines), env)
+        if checks["python_import_probe"]["stdout"]:
+            checks["module_probe"] = checks["python_import_probe"]["stdout"]
+        if not checks["python_import_probe"]["ok"]:
+            blocking_errors.append(
+                f"DECIMER failed to import in {sys.executable}. "
+                "Install `decimer` into that interpreter or set MOLECULE_SMILES_RESCUE=off."
+            )
 
     return {
         "blocking_errors": blocking_errors,
@@ -1262,7 +1404,14 @@ def collect_preflight_diagnostics(file_path: str, mode: str, values: Dict[str, s
         "main_llm_preflight": _profile_preflight("main", required=main_required, values=values),
         "ocr_llm_preflight": _profile_preflight("ocr", required=ocr_llm_required, values=values),
         "model_catalog_preflight": _model_catalog_preflight(mode, resolved_ocr_backend, values),
+        "torch_runtime_preflight": _torch_runtime_preflight(
+            mode,
+            resolved_ocr_backend,
+            include_pdf_section=include_pdf_section,
+            values=values,
+        ),
         "ocr_preflight": _ocr_preflight(mode, values),
+        "molecule_smiles_rescue_preflight": _molecule_smiles_rescue_preflight(values),
         "asset_preflight": _asset_preflight(file_path, mode, values),
         "runtime_provider_preflight": collect_runtime_provider_preflight(profile_configs=[values], mode=mode),
     }
@@ -1276,7 +1425,9 @@ def collect_preflight_diagnostics(file_path: str, mode: str, values: Dict[str, s
         "main_llm_preflight",
         "ocr_llm_preflight",
         "model_catalog_preflight",
+        "torch_runtime_preflight",
         "ocr_preflight",
+        "molecule_smiles_rescue_preflight",
         "asset_preflight",
         "pdf_preflight",
         "runtime_provider_preflight",
@@ -1454,6 +1605,8 @@ def refresh_main_models(
     ocr_lang: str,
     ocr_config: str,
     tesseract_cmd: str,
+    molecule_smiles_rescue: str,
+    molecule_smiles_rescue_confidence: str,
     pdf_model_size: str,
     pdf_persist_images: bool,
     pdf_persist_dir: str,
@@ -1486,6 +1639,8 @@ def refresh_main_models(
         ocr_lang,
         ocr_config,
         tesseract_cmd,
+        molecule_smiles_rescue,
+        molecule_smiles_rescue_confidence,
         pdf_model_size,
         pdf_persist_images,
         pdf_persist_dir,
@@ -1523,6 +1678,8 @@ def refresh_ocr_models(
     ocr_lang: str,
     ocr_config: str,
     tesseract_cmd: str,
+    molecule_smiles_rescue: str,
+    molecule_smiles_rescue_confidence: str,
     pdf_model_size: str,
     pdf_persist_images: bool,
     pdf_persist_dir: str,
@@ -1555,6 +1712,8 @@ def refresh_ocr_models(
         ocr_lang,
         ocr_config,
         tesseract_cmd,
+        molecule_smiles_rescue,
+        molecule_smiles_rescue_confidence,
         pdf_model_size,
         pdf_persist_images,
         pdf_persist_dir,
@@ -1593,6 +1752,8 @@ def run_preflight(
     ocr_lang: str,
     ocr_config: str,
     tesseract_cmd: str,
+    molecule_smiles_rescue: str,
+    molecule_smiles_rescue_confidence: str,
     pdf_model_size: str,
     pdf_persist_images: bool,
     pdf_persist_dir: str,
@@ -1626,6 +1787,8 @@ def run_preflight(
         ocr_lang,
         ocr_config,
         tesseract_cmd,
+        molecule_smiles_rescue,
+        molecule_smiles_rescue_confidence,
         pdf_model_size,
         pdf_persist_images,
         pdf_persist_dir,
@@ -1677,6 +1840,8 @@ def run_pipeline(
     ocr_lang: str,
     ocr_config: str,
     tesseract_cmd: str,
+    molecule_smiles_rescue: str,
+    molecule_smiles_rescue_confidence: str,
     pdf_model_size: str,
     pdf_persist_images: bool,
     pdf_persist_dir: str,
@@ -1710,6 +1875,8 @@ def run_pipeline(
         ocr_lang,
         ocr_config,
         tesseract_cmd,
+        molecule_smiles_rescue,
+        molecule_smiles_rescue_confidence,
         pdf_model_size,
         pdf_persist_images,
         pdf_persist_dir,
@@ -1820,6 +1987,8 @@ def submit_live_dataset(
     ocr_lang: str,
     ocr_config: str,
     tesseract_cmd: str,
+    molecule_smiles_rescue: str,
+    molecule_smiles_rescue_confidence: str,
     pdf_model_size: str,
     pdf_persist_images: bool,
     pdf_persist_dir: str,
@@ -1868,6 +2037,8 @@ def submit_live_dataset(
         ocr_lang,
         ocr_config,
         tesseract_cmd,
+        molecule_smiles_rescue,
+        molecule_smiles_rescue_confidence,
         pdf_model_size,
         pdf_persist_images,
         pdf_persist_dir,
@@ -1955,6 +2126,8 @@ def submit_sideload_dataset(
     ocr_lang: str,
     ocr_config: str,
     tesseract_cmd: str,
+    molecule_smiles_rescue: str,
+    molecule_smiles_rescue_confidence: str,
     pdf_model_size: str,
     pdf_persist_images: bool,
     pdf_persist_dir: str,
@@ -2002,6 +2175,8 @@ def submit_sideload_dataset(
         ocr_lang,
         ocr_config,
         tesseract_cmd,
+        molecule_smiles_rescue,
+        molecule_smiles_rescue_confidence,
         pdf_model_size,
         pdf_persist_images,
         pdf_persist_dir,
@@ -2586,6 +2761,18 @@ def build_app() -> gr.Blocks:
                         value=vals.get("TESSERACT_CMD", ""),
                         placeholder="Optional absolute path to tesseract",
                     )
+                    gr.Markdown("Optional DECIMER rescue applies only to direct molecule extraction in this branch. It does not affect RxnIM reaction/coreference outputs.")
+                    with gr.Row():
+                        molecule_smiles_rescue = gr.Dropdown(
+                            choices=MOLECULE_SMILES_RESCUE_CHOICES,
+                            value=vals.get("MOLECULE_SMILES_RESCUE", "off") or "off",
+                            label="MOLECULE_SMILES_RESCUE",
+                        )
+                        molecule_smiles_rescue_confidence = gr.Textbox(
+                            label="MOLECULE_SMILES_RESCUE_CONFIDENCE",
+                            value=vals.get("MOLECULE_SMILES_RESCUE_CONFIDENCE", "0.85") or "0.85",
+                            placeholder="0.85",
+                        )
 
                 with gr.Tab("PDF"):
                     gr.Markdown("PDF runs use VisualHeist to crop figures/tables into temporary PNGs before sending them through the normal image pipeline.")
@@ -2886,6 +3073,8 @@ def build_app() -> gr.Blocks:
             ocr_lang,
             ocr_config,
             tesseract_cmd,
+            molecule_smiles_rescue,
+            molecule_smiles_rescue_confidence,
             pdf_model_size,
             pdf_persist_images,
             pdf_persist_dir,
@@ -2920,6 +3109,8 @@ def build_app() -> gr.Blocks:
             ocr_lang,
             ocr_config,
             tesseract_cmd,
+            molecule_smiles_rescue,
+            molecule_smiles_rescue_confidence,
             pdf_model_size,
             pdf_persist_images,
             pdf_persist_dir,

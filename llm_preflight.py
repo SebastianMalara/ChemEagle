@@ -209,13 +209,14 @@ def collect_runtime_provider_preflight(
     seen: set[str] = set()
 
     for config in profile_configs:
-        main_profile = resolve_llm_profile(scope="main", values=config, default_model="gpt-5-mini")
         required_scopes = [("main", "main_text", mode == "cloud")]
         raw_ocr_backend = resolved_ocr_backend or str(config.get("OCR_BACKEND") or config.get("ocr_backend") or "auto")
         ocr_backend = resolve_ocr_backend(raw_ocr_backend, str(config.get("CHEMEAGLE_RUN_MODE") or config.get("mode") or mode))
         if ocr_backend == "llm_vision":
             required_scopes.append(("ocr", "ocr_vision", True))
         for scope, purpose, required in required_scopes:
+            if not required:
+                continue
             profile = resolve_llm_profile(scope=scope, values=config, default_model="gpt-5-mini")
             key = profile_probe_key(profile, purpose=purpose)
             if key in seen:

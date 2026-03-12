@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -11,7 +12,7 @@ from PIL import Image
 
 import review_service as review_service_module
 from review_db import ReviewRepository
-from review_service import ReviewDatasetService, _apply_runtime_env, _rewrite_payload_image_refs
+from review_service import ReviewDatasetService, _apply_runtime_env, _cleanup_runtime_after_source, _rewrite_payload_image_refs
 from review_tracking import RunMetricsCollector
 from review_artifacts import create_artifact_store_from_config
 
@@ -54,6 +55,81 @@ class ReviewServiceTests(unittest.TestCase):
             self.assertEqual(rewritten["plan"][0]["arguments"]["image_path"], expected_ref)
             self.assertEqual(rewritten["plan"][0]["arguments"]["original_image_path"], "/tmp/worker/source.png")
             self.assertEqual(rewritten["plan"][0]["arguments"]["image_artifact_key"], artifact_key)
+
+    def test_cleanup_runtime_after_source_clears_per_source_caches(self) -> None:
+        fake_r_group = mock.Mock()
+        fake_r_group._process_multi_molecular_cache = {"a": object(), "b": object()}
+        fake_r_group._raw_results_cache = {"c": object()}
+        fake_r_group._RUNTIME_TOOLKIT = object()
+        fake_r_group._RUNTIME_RXNIM = object()
+        fake_r_group._RUNTIME_DEVICE_TYPE = "mps"
+        fake_reaction_agent = mock.Mock()
+        fake_reaction_agent._RUNTIME_RXNIM = object()
+        fake_reaction_agent._RUNTIME_DEVICE_TYPE = "mps"
+        fake_molecular_agent = mock.Mock()
+        fake_molecular_agent._RUNTIME_TOOLKIT = object()
+        fake_molecular_agent._RUNTIME_DEVICE_TYPE = "mps"
+        fake_text_agent = mock.Mock()
+        fake_text_agent._CHEMNER_MODELS = {"chemner": object()}
+        fake_text_agent._RXN_EXTRACTORS = {"rxn": object()}
+        fake_text_agent._EASYOCR_READERS = {("en", "cpu"): object()}
+        fake_text_agent._OCR_TEXT_CACHE = {("img", "easyocr"): "text"}
+        fake_cuda = mock.Mock()
+        fake_cuda.is_available.return_value = False
+        fake_mps = mock.Mock()
+        fake_mps.is_available.return_value = True
+        fake_torch = mock.Mock(cuda=fake_cuda, mps=fake_mps)
+        fake_toolkit_cls = mock.Mock()
+        fake_toolkit_cls.init_molnextr.cache_clear = mock.Mock()
+        fake_toolkit_cls.init_rxnim.cache_clear = mock.Mock()
+        fake_toolkit_cls.init_pdfparser.cache_clear = mock.Mock()
+        fake_toolkit_cls.init_moldet.cache_clear = mock.Mock()
+        fake_toolkit_cls.init_coref.cache_clear = mock.Mock()
+        fake_toolkit_cls.init_chemrxnextractor.cache_clear = mock.Mock()
+        fake_toolkit_cls.init_chemner.cache_clear = mock.Mock()
+        fake_toolkit_interface = mock.Mock(ChemIEToolkit=fake_toolkit_cls)
+        logger = mock.Mock()
+
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "get_R_group_sub_agent": fake_r_group,
+                "get_reaction_agent": fake_reaction_agent,
+                "get_molecular_agent": fake_molecular_agent,
+                "get_text_agent": fake_text_agent,
+                "chemietoolkit.interface": fake_toolkit_interface,
+                "torch": fake_torch,
+            },
+            clear=False,
+        ), mock.patch.object(review_service_module.gc, "collect", return_value=7):
+            _cleanup_runtime_after_source("batch-1.pdf", logger)
+
+        self.assertEqual(fake_r_group._process_multi_molecular_cache, {})
+        self.assertEqual(fake_r_group._raw_results_cache, {})
+        self.assertIsNone(fake_r_group._RUNTIME_TOOLKIT)
+        self.assertIsNone(fake_r_group._RUNTIME_RXNIM)
+        self.assertIsNone(fake_r_group._RUNTIME_DEVICE_TYPE)
+        self.assertIsNone(fake_reaction_agent._RUNTIME_RXNIM)
+        self.assertIsNone(fake_reaction_agent._RUNTIME_DEVICE_TYPE)
+        self.assertIsNone(fake_molecular_agent._RUNTIME_TOOLKIT)
+        self.assertIsNone(fake_molecular_agent._RUNTIME_DEVICE_TYPE)
+        self.assertEqual(fake_text_agent._CHEMNER_MODELS, {})
+        self.assertEqual(fake_text_agent._RXN_EXTRACTORS, {})
+        self.assertEqual(fake_text_agent._EASYOCR_READERS, {})
+        self.assertEqual(fake_text_agent._OCR_TEXT_CACHE, {})
+        fake_toolkit_cls.init_molnextr.cache_clear.assert_called_once_with()
+        fake_toolkit_cls.init_rxnim.cache_clear.assert_called_once_with()
+        fake_toolkit_cls.init_pdfparser.cache_clear.assert_called_once_with()
+        fake_toolkit_cls.init_moldet.cache_clear.assert_called_once_with()
+        fake_toolkit_cls.init_coref.cache_clear.assert_called_once_with()
+        fake_toolkit_cls.init_chemrxnextractor.cache_clear.assert_called_once_with()
+        fake_toolkit_cls.init_chemner.cache_clear.assert_called_once_with()
+        fake_mps.empty_cache.assert_called_once_with()
+        logger.info.assert_called_once()
+        _, message = logger.info.call_args.args[:2]
+        self.assertIn("batch-1.pdf", message)
+        self.assertEqual(logger.info.call_args.kwargs["gc_collected"], 7)
+        self.assertEqual(logger.info.call_args.kwargs["allocator_caches_cleared"], "mps")
 
     def test_sideload_import_recovers_image_and_persists_reaction(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -466,7 +542,7 @@ class ReviewServiceTests(unittest.TestCase):
             self.assertEqual(stored_payload["plan"][0]["arguments"]["image_path"], expected_ref)
             self.assertEqual(stored_payload["execution_logs"][0]["arguments"]["image_path"], expected_ref)
 
-    def test_live_image_redo_auto_retries_with_no_agents(self) -> None:
+    def test_live_image_redo_with_allowlisted_observer_issue_auto_retries_with_no_agents(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             db_path = tmp / "review.sqlite3"
@@ -478,9 +554,14 @@ class ReviewServiceTests(unittest.TestCase):
             execution_modes: list[str] = []
             redo_payload = {
                 "redo": True,
+                "observer_verdict": {
+                    "redo": True,
+                    "reason": "No reaction extracted from the tool outputs.",
+                    "issue_codes": ["no_reaction_detected"],
+                    "confidence": 0.94,
+                },
                 "plan": [],
                 "execution_logs": [],
-                "reactions": [],
             }
             valid_payload = {
                 "reactions": [
@@ -534,6 +615,342 @@ class ReviewServiceTests(unittest.TestCase):
             self.assertEqual(attempts[0]["execution_mode"], "normal")
             self.assertEqual(attempts[1]["execution_mode"], "no_agents")
             self.assertEqual(attempts[1]["trigger"], "auto_no_agents_retry")
+            self.assertEqual(derived["accepted_reaction_count"], 1)
+
+    def test_live_image_redo_with_accepted_reactions_does_not_auto_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db_path = tmp / "review.sqlite3"
+            artifact_root = tmp / "artifacts"
+            image_path = tmp / "accepted.png"
+            Image.new("RGB", (64, 64), "white").save(image_path)
+
+            service = ReviewDatasetService(ReviewRepository(db_path))
+            execution_modes: list[str] = []
+            payload = {
+                "redo": True,
+                "observer_verdict": {
+                    "redo": True,
+                    "reason": "Potential chemistry issue detected.",
+                    "issue_codes": ["suspect_smiles"],
+                    "confidence": 0.72,
+                },
+                "reactions": [
+                    {
+                        "reaction_id": "rxn-1",
+                        "reactants": [{"smiles": "CCO", "label": "A"}],
+                        "products": [{"smiles": "CC=O", "label": "B"}],
+                        "conditions": [],
+                    }
+                ],
+            }
+
+            def fake_execute(image_path: str, config: dict, *, execution_mode: str = "normal"):
+                del image_path, config
+                execution_modes.append(execution_mode)
+                return payload, RunMetricsCollector()
+
+            with mock.patch.object(service, "_execute_image_pipeline", side_effect=fake_execute):
+                result = service.submit_live_experiment(
+                    experiment_name="accepted redo batch",
+                    notes="",
+                    source_paths=[str(image_path)],
+                    profile_configs=[
+                        {
+                            "profile_label": "baseline",
+                            "ARTIFACT_BACKEND": "filesystem",
+                            "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root),
+                            "CHEMEAGLE_RUN_MODE": "cloud",
+                        }
+                    ],
+                )
+                service._queue.join()
+
+            runs = service.list_runs(result["experiment_id"])
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["status"], "completed")
+            self.assertEqual(runs[0]["total_reactions"], 1)
+            self.assertEqual(execution_modes, ["normal"])
+
+            sources = service.list_run_sources(runs[0]["run_id"])
+            detail = service.get_run_source_monitor(sources[0]["run_source_id"])
+            derived = detail["derived_images"][0]
+            self.assertEqual(derived["accepted_reaction_count"], 1)
+            self.assertEqual(derived["normalization_status"], "accepted")
+            self.assertEqual(len(derived["attempts"]), 1)
+
+    def test_live_image_redo_with_rejected_candidates_does_not_auto_retry(self) -> None:
+        cases = [
+            (
+                "missing",
+                {
+                    "reaction_id": "rxn-missing",
+                    "reactants": [{"smiles": "None", "label": "A"}],
+                    "products": [{"smiles": None, "label": "B"}],
+                    "conditions": [],
+                },
+                "rejected_missing_smiles",
+            ),
+            (
+                "invalid",
+                {
+                    "reaction_id": "rxn-invalid",
+                    "reactants": [{"smiles": "C1=", "label": "A"}],
+                    "products": [{"smiles": "C1=", "label": "B"}],
+                    "conditions": [],
+                },
+                "rejected_invalid_smiles",
+            ),
+        ]
+        for label, reaction, expected_status in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp = Path(tmpdir)
+                    db_path = tmp / "review.sqlite3"
+                    artifact_root = tmp / "artifacts"
+                    image_path = tmp / f"{label}.png"
+                    Image.new("RGB", (64, 64), "white").save(image_path)
+
+                    service = ReviewDatasetService(ReviewRepository(db_path))
+                    execution_modes: list[str] = []
+                    payload = {
+                        "redo": True,
+                        "observer_verdict": {
+                            "redo": True,
+                            "reason": "Extraction looked incomplete.",
+                            "issue_codes": ["missing_core_reaction"],
+                            "confidence": 0.88,
+                        },
+                        "reactions": [reaction],
+                    }
+
+                    def fake_execute(image_path: str, config: dict, *, execution_mode: str = "normal"):
+                        del image_path, config
+                        execution_modes.append(execution_mode)
+                        return payload, RunMetricsCollector()
+
+                    with mock.patch.object(service, "_execute_image_pipeline", side_effect=fake_execute):
+                        result = service.submit_live_experiment(
+                            experiment_name=f"{label} redo batch",
+                            notes="",
+                            source_paths=[str(image_path)],
+                            profile_configs=[
+                                {
+                                    "profile_label": "baseline",
+                                    "ARTIFACT_BACKEND": "filesystem",
+                                    "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root),
+                                    "CHEMEAGLE_RUN_MODE": "cloud",
+                                }
+                            ],
+                        )
+                        service._queue.join()
+
+                    runs = service.list_runs(result["experiment_id"])
+                    self.assertEqual(len(runs), 1)
+                    self.assertEqual(execution_modes, ["normal"])
+
+                    sources = service.list_run_sources(runs[0]["run_id"])
+                    detail = service.get_run_source_monitor(sources[0]["run_source_id"])
+                    derived = detail["derived_images"][0]
+                    self.assertEqual(derived["accepted_reaction_count"], 0)
+                    self.assertEqual(derived["normalization_status"], expected_status)
+                    self.assertEqual(len(derived["attempts"]), 1)
+
+    def test_live_image_redo_with_malformed_or_empty_observer_verdict_does_not_auto_retry(self) -> None:
+        cases = [
+            ("empty_dict", {}),
+            ("malformed_string", "not-json"),
+        ]
+        for label, verdict in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    tmp = Path(tmpdir)
+                    db_path = tmp / "review.sqlite3"
+                    artifact_root = tmp / "artifacts"
+                    image_path = tmp / f"{label}.png"
+                    Image.new("RGB", (64, 64), "white").save(image_path)
+
+                    service = ReviewDatasetService(ReviewRepository(db_path))
+                    execution_modes: list[str] = []
+                    payload = {
+                        "redo": True,
+                        "observer_verdict": verdict,
+                        "plan": [],
+                        "execution_logs": [],
+                    }
+
+                    def fake_execute(image_path: str, config: dict, *, execution_mode: str = "normal"):
+                        del image_path, config
+                        execution_modes.append(execution_mode)
+                        return payload, RunMetricsCollector()
+
+                    with mock.patch.object(service, "_execute_image_pipeline", side_effect=fake_execute):
+                        result = service.submit_live_experiment(
+                            experiment_name=f"{label} redo batch",
+                            notes="",
+                            source_paths=[str(image_path)],
+                            profile_configs=[
+                                {
+                                    "profile_label": "baseline",
+                                    "ARTIFACT_BACKEND": "filesystem",
+                                    "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root),
+                                    "CHEMEAGLE_RUN_MODE": "cloud",
+                                }
+                            ],
+                        )
+                        service._queue.join()
+
+                    runs = service.list_runs(result["experiment_id"])
+                    self.assertEqual(len(runs), 1)
+                    self.assertEqual(execution_modes, ["normal"])
+
+                    sources = service.list_run_sources(runs[0]["run_id"])
+                    detail = service.get_run_source_monitor(sources[0]["run_source_id"])
+                    derived = detail["derived_images"][0]
+                    self.assertEqual(derived["normalization_status"], "none_found")
+                    self.assertEqual(len(derived["attempts"]), 1)
+
+    def test_live_image_redo_legacy_policy_auto_retries_with_no_agents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db_path = tmp / "review.sqlite3"
+            artifact_root = tmp / "artifacts"
+            image_path = tmp / "legacy.png"
+            Image.new("RGB", (64, 64), "white").save(image_path)
+
+            service = ReviewDatasetService(ReviewRepository(db_path))
+            execution_modes: list[str] = []
+            redo_payload = {
+                "redo": True,
+                "observer_verdict": {},
+                "plan": [],
+                "execution_logs": [],
+            }
+            valid_payload = {
+                "reactions": [
+                    {
+                        "reaction_id": "rxn-1",
+                        "reactants": [{"smiles": "CCO", "label": "A"}],
+                        "products": [{"smiles": "CC=O", "label": "B"}],
+                        "conditions": [],
+                    }
+                ]
+            }
+
+            def fake_execute(image_path: str, config: dict, *, execution_mode: str = "normal"):
+                del image_path, config
+                execution_modes.append(execution_mode)
+                if execution_mode == "normal":
+                    return redo_payload, RunMetricsCollector()
+                if execution_mode == "no_agents":
+                    return valid_payload, RunMetricsCollector()
+                raise AssertionError(f"Unexpected execution mode: {execution_mode}")
+
+            with mock.patch.object(service, "_execute_image_pipeline", side_effect=fake_execute):
+                result = service.submit_live_experiment(
+                    experiment_name="legacy redo batch",
+                    notes="",
+                    source_paths=[str(image_path)],
+                    profile_configs=[
+                        {
+                            "profile_label": "baseline",
+                            "ARTIFACT_BACKEND": "filesystem",
+                            "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root),
+                            "CHEMEAGLE_RUN_MODE": "cloud",
+                            "CHEMEAGLE_REDO_POLICY": "legacy",
+                        }
+                    ],
+                )
+                service._queue.join()
+
+            runs = service.list_runs(result["experiment_id"])
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["status"], "completed")
+            self.assertEqual(execution_modes, ["normal", "no_agents"])
+
+            sources = service.list_run_sources(runs[0]["run_id"])
+            detail = service.get_run_source_monitor(sources[0]["run_source_id"])
+            attempts = detail["derived_images"][0]["attempts"]
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(attempts[1]["trigger"], "auto_no_agents_retry")
+
+    def test_live_image_redo_after_no_agents_local_runtime_error_uses_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db_path = tmp / "review.sqlite3"
+            artifact_root = tmp / "artifacts"
+            image_path = tmp / "recovery.png"
+            Image.new("RGB", (64, 64), "white").save(image_path)
+
+            service = ReviewDatasetService(ReviewRepository(db_path))
+            execution_modes: list[str] = []
+            redo_payload = {
+                "redo": True,
+                "observer_verdict": {
+                    "redo": True,
+                    "reason": "No reaction detected.",
+                    "issue_codes": ["no_reaction_detected"],
+                    "confidence": 0.97,
+                },
+                "plan": [],
+                "execution_logs": [],
+            }
+            valid_payload = {
+                "reactions": [
+                    {
+                        "reaction_id": "rxn-1",
+                        "reactants": [{"smiles": "CCO", "label": "A"}],
+                        "products": [{"smiles": "CC=O", "label": "B"}],
+                        "conditions": [],
+                    }
+                ]
+            }
+
+            def fake_execute(image_path: str, config: dict, *, execution_mode: str = "normal"):
+                del image_path, config
+                execution_modes.append(execution_mode)
+                if execution_mode == "normal":
+                    return redo_payload, RunMetricsCollector()
+                if execution_mode == "no_agents":
+                    raise IndexError("boom")
+                raise AssertionError(f"Unexpected execution mode: {execution_mode}")
+
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(service, "_execute_image_pipeline", side_effect=fake_execute))
+                stack.enter_context(
+                    mock.patch.object(
+                        service,
+                        "_execute_image_pipeline_recovery_subprocess",
+                        return_value=(valid_payload, RunMetricsCollector()),
+                    )
+                )
+                result = service.submit_live_experiment(
+                    experiment_name="recovery redo batch",
+                    notes="",
+                    source_paths=[str(image_path)],
+                    profile_configs=[
+                        {
+                            "profile_label": "baseline",
+                            "ARTIFACT_BACKEND": "filesystem",
+                            "ARTIFACT_FILESYSTEM_ROOT": str(artifact_root),
+                            "CHEMEAGLE_RUN_MODE": "cloud",
+                        }
+                    ],
+                )
+                service._queue.join()
+
+            runs = service.list_runs(result["experiment_id"])
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(runs[0]["status"], "completed")
+            self.assertEqual(execution_modes, ["normal", "no_agents"])
+
+            sources = service.list_run_sources(runs[0]["run_id"])
+            detail = service.get_run_source_monitor(sources[0]["run_source_id"])
+            derived = detail["derived_images"][0]
+            attempts = derived["attempts"]
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(attempts[1]["execution_mode"], "no_agents")
+            self.assertEqual(attempts[2]["execution_mode"], "recovery")
             self.assertEqual(derived["accepted_reaction_count"], 1)
 
     def test_reprocess_normalization_for_run_purges_invalid_canonical_reactions(self) -> None:
