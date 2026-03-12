@@ -25,6 +25,7 @@ from runtime_guards import (
     RuntimeStageError,
     assistant_message as guarded_assistant_message,
     first_dict_item,
+    first_item,
     message_content,
     safe_json_loads,
     tool_calls_or_empty,
@@ -105,6 +106,24 @@ def _normalize_chat_message(message):
 
     return normalized
 
+
+def _empty_reaction_sections() -> dict:
+    return {
+        "reactants": [],
+        "conditions": [],
+        "products": [],
+    }
+
+
+def _first_prediction_or_empty(raw_prediction, *, context: str) -> dict:
+    if isinstance(raw_prediction, dict):
+        return raw_prediction
+    raw_root = first_item(raw_prediction, context=context, default=None)
+    if isinstance(raw_root, dict):
+        return raw_root
+    print(f"warning: {context}: empty result list")
+    return _empty_reaction_sections()
+
 def get_reaction(image_path: str) -> dict:
     '''
     Returns a structured dictionary of reactions extracted from the image,
@@ -115,15 +134,14 @@ def get_reaction(image_path: str) -> dict:
 
     image_file = image_path
     raw_prediction = _get_rxnim().predict_image_file(image_file, molnextr=True, ocr=True)
-    raw_root = first_dict_item(
+    raw_root = _first_prediction_or_empty(
         raw_prediction,
         context="reaction_agent.predict_image_file",
-        retry_trigger="auto_recovery_retry",
     )
     #print(f'raw_prediction:{raw_prediction}')
 
     # Ensure raw_prediction is treated as a list directly
-    structured_output = {}
+    structured_output = _empty_reaction_sections()
     for section_key in ['reactants', 'conditions', 'products']:
         if section_key in raw_root:
             structured_output[section_key] = []
@@ -404,7 +422,10 @@ def get_reaction_withatoms(image_path: str) -> dict:
     updated_data = [
         update_input_with_symbols(
             gpt_output,
-            first_dict_item(input2, context="reaction_agent.get_reaction_full", retry_trigger="auto_recovery_retry"),
+            _first_prediction_or_empty(
+                input2,
+                context="reaction_agent.get_reaction_full",
+            ),
             _convert_graph_to_smiles,
         )
     ]
@@ -649,7 +670,10 @@ def get_reaction_withatoms_correctR(image_path: str) -> dict:
     updated_data = [
         update_input_with_symbols(
             gpt_output,
-            first_dict_item(input2, context="reaction_agent_correctR_os.get_reaction_full", retry_trigger="auto_recovery_retry"),
+            _first_prediction_or_empty(
+                input2,
+                context="reaction_agent_correctR_os.get_reaction_full",
+            ),
             _convert_graph_to_smiles,
         )
     ]
@@ -901,7 +925,10 @@ def get_reaction_withatoms_correctR_OS(
     updated_data = [
         update_input_with_symbols(
             gpt_output,
-            first_dict_item(input2, context="reaction_agent_os.get_reaction_full", retry_trigger="auto_recovery_retry"),
+            _first_prediction_or_empty(
+                input2,
+                context="reaction_agent_os.get_reaction_full",
+            ),
             _convert_graph_to_smiles,
         )
     ]

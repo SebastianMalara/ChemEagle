@@ -14,6 +14,11 @@ import pytorch_lightning as pl
 from pytorch_lightning import LightningModule, LightningDataModule
 from pytorch_lightning.callbacks import LearningRateMonitor
 from pytorch_lightning.strategies.ddp import DDPStrategy
+
+from hf_runtime import configure_transformers_runtime
+
+configure_transformers_runtime()
+
 from transformers import get_scheduler
 import transformers 
 

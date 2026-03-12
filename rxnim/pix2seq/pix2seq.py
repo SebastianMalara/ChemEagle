@@ -10,6 +10,10 @@ from torch import nn
 from .misc import nested_tensor_from_tensor_list
 from .backbone import build_backbone
 from .transformer import build_transformer
+from hf_runtime import configure_transformers_runtime
+
+configure_transformers_runtime()
+
 from transformers import GenerationConfig
 
 import numpy as np

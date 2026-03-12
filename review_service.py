@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import gc
 import hashlib
 import copy
 import json
@@ -19,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from rdkit import Chem
 
+from hf_runtime import configure_transformers_runtime
 from llm_preflight import RunFailureController, RunFailureControllerState, classify_provider_exception
 from review_artifacts import ArtifactStore, create_artifact_store_from_config
 from review_db import ReviewRepository
@@ -66,6 +68,15 @@ STABLE_FAILURE_CATEGORIES = {
     "local_runtime_error",
     "normalization_rejected",
     "redo_pending",
+}
+DEFAULT_REDO_POLICY = "gated"
+LEGACY_REDO_POLICY = "legacy"
+REDO_POLICY_VALUES = {DEFAULT_REDO_POLICY, LEGACY_REDO_POLICY}
+OBSERVER_AUTO_RETRY_ISSUE_CODES = {
+    "no_reaction_detected",
+    "tool_output_empty",
+    "missing_core_structure",
+    "malformed_result_shape",
 }
 
 
@@ -138,6 +149,102 @@ def _source_set_fingerprint(paths: Sequence[str]) -> str:
 
 def _config_hash(config: Dict[str, Any]) -> str:
     return _hash_text(json.dumps(config, sort_keys=True, ensure_ascii=False, default=str))
+
+
+def _cleanup_runtime_after_source(source_name: str, run_logger) -> None:
+    cache_counts: Dict[str, Any] = {}
+
+    r_group_module = sys.modules.get("get_R_group_sub_agent")
+    if r_group_module is not None:
+        for attr_name, label in (
+            ("_process_multi_molecular_cache", "r_group_multi_cache_entries"),
+            ("_raw_results_cache", "r_group_raw_cache_entries"),
+        ):
+            cache = getattr(r_group_module, attr_name, None)
+            if isinstance(cache, dict):
+                cache_counts[label] = len(cache)
+                cache.clear()
+        for attr_name in ("_RUNTIME_TOOLKIT", "_RUNTIME_RXNIM", "_RUNTIME_DEVICE_TYPE"):
+            if hasattr(r_group_module, attr_name):
+                setattr(r_group_module, attr_name, None)
+                cache_counts[f"reset_{attr_name.lower()}"] = True
+
+    reaction_module = sys.modules.get("get_reaction_agent")
+    if reaction_module is not None:
+        for attr_name in ("_RUNTIME_RXNIM", "_RUNTIME_DEVICE_TYPE"):
+            if hasattr(reaction_module, attr_name):
+                setattr(reaction_module, attr_name, None)
+                cache_counts[f"reset_reaction_agent_{attr_name.lower()}"] = True
+
+    molecular_module = sys.modules.get("get_molecular_agent")
+    if molecular_module is not None:
+        for attr_name in ("_RUNTIME_TOOLKIT", "_RUNTIME_DEVICE_TYPE"):
+            if hasattr(molecular_module, attr_name):
+                setattr(molecular_module, attr_name, None)
+                cache_counts[f"reset_molecular_agent_{attr_name.lower()}"] = True
+
+    text_module = sys.modules.get("get_text_agent")
+    if text_module is not None:
+        for attr_name, label in (
+            ("_CHEMNER_MODELS", "chemner_model_cache_entries"),
+            ("_RXN_EXTRACTORS", "rxn_extractor_cache_entries"),
+            ("_EASYOCR_READERS", "easyocr_reader_cache_entries"),
+            ("_OCR_TEXT_CACHE", "ocr_text_cache_entries"),
+        ):
+            cache = getattr(text_module, attr_name, None)
+            if isinstance(cache, dict):
+                cache_counts[label] = len(cache)
+                cache.clear()
+
+    toolkit_interface_module = sys.modules.get("chemietoolkit.interface")
+    if toolkit_interface_module is not None:
+        toolkit_cls = getattr(toolkit_interface_module, "ChemIEToolkit", None)
+        if toolkit_cls is not None:
+            cleared_method_caches: List[str] = []
+            for method_name in (
+                "init_molnextr",
+                "init_rxnim",
+                "init_pdfparser",
+                "init_moldet",
+                "init_coref",
+                "init_chemrxnextractor",
+                "init_chemner",
+            ):
+                method = getattr(toolkit_cls, method_name, None)
+                cache_clear = getattr(method, "cache_clear", None)
+                if callable(cache_clear):
+                    cache_clear()
+                    cleared_method_caches.append(method_name)
+            if cleared_method_caches:
+                cache_counts["toolkit_method_caches_cleared"] = ",".join(cleared_method_caches)
+
+    cache_counts["gc_collected"] = gc.collect()
+
+    cleared_allocators: List[str] = []
+    torch_module = sys.modules.get("torch")
+    if torch_module is not None:
+        cuda = getattr(torch_module, "cuda", None)
+        if cuda is not None and callable(getattr(cuda, "is_available", None)) and cuda.is_available():
+            empty_cache = getattr(cuda, "empty_cache", None)
+            if callable(empty_cache):
+                empty_cache()
+                cleared_allocators.append("cuda")
+        mps = getattr(torch_module, "mps", None)
+        if mps is not None:
+            is_available = getattr(mps, "is_available", None)
+            empty_cache = getattr(mps, "empty_cache", None)
+            if callable(empty_cache) and (not callable(is_available) or is_available()):
+                empty_cache()
+                cleared_allocators.append("mps")
+
+    if cleared_allocators:
+        cache_counts["allocator_caches_cleared"] = ",".join(cleared_allocators)
+
+    run_logger.info(
+        "source_runtime_cleanup",
+        f"Cleared per-source runtime caches after {source_name}",
+        **cache_counts,
+    )
 
 
 def _valid_smiles(smiles: str) -> bool:
@@ -412,10 +519,8 @@ def _normalize_reaction_candidates(payload: Dict[str, Any]) -> NormalizationSumm
         normalization_status = "partial"
     elif accepted:
         normalization_status = "accepted"
-    elif payload.get("redo"):
-        normalization_status = "redo_pending"
     elif not candidates:
-        normalization_status = "none_found"
+        normalization_status = "redo_pending" if payload.get("redo") and _observer_has_allowlisted_issue(payload) else "none_found"
     elif rejected_reasons == {"rejected_missing_smiles"}:
         normalization_status = "rejected_missing_smiles"
     else:
@@ -451,7 +556,7 @@ def _classify_payload(payload: Dict[str, Any], *, artifact_missing: bool = False
     normalization = _normalize_reaction_candidates(payload)
     if normalization.accepted_reaction_count > 0:
         return "succeeded"
-    if payload.get("redo") or normalization.normalization_status == "redo_pending":
+    if normalization.normalization_status == "redo_pending":
         return "needs_redo"
     if normalization.normalization_status == "none_found":
         return "empty"
@@ -625,6 +730,62 @@ def _matching_partial_payload(
         if Path(raw_path).name.strip() in candidates:
             return payload
     return None
+
+
+def _normalize_observer_issue_codes(value: Any) -> List[str]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        items = []
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        code = item.strip().lower()
+        if not code:
+            continue
+        if code not in seen:
+            normalized.append(code)
+            seen.add(code)
+    return normalized
+
+
+def _observer_verdict(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw = payload.get("observer_verdict")
+    if not isinstance(raw, dict):
+        return {"redo": False, "reason": "", "issue_codes": [], "confidence": 0.0}
+    verdict = {
+        "redo": bool(raw.get("redo", False)),
+        "reason": str(raw.get("reason") or ""),
+        "issue_codes": _normalize_observer_issue_codes(raw.get("issue_codes")),
+        "confidence": 0.0,
+    }
+    try:
+        verdict["confidence"] = max(0.0, min(1.0, float(raw.get("confidence", 0.0))))
+    except (TypeError, ValueError):
+        verdict["confidence"] = 0.0
+    return verdict
+
+
+def _observer_has_allowlisted_issue(payload: Dict[str, Any]) -> bool:
+    verdict = _observer_verdict(payload)
+    return bool(set(verdict["issue_codes"]) & OBSERVER_AUTO_RETRY_ISSUE_CODES)
+
+
+def _redo_policy(config: Optional[Dict[str, Any]] = None) -> str:
+    candidate = ""
+    if config:
+        candidate = str(
+            config.get("CHEMEAGLE_REDO_POLICY")
+            or config.get("chemeagle_redo_policy")
+            or ""
+        ).strip().lower()
+    if not candidate:
+        candidate = str(os.getenv("CHEMEAGLE_REDO_POLICY", DEFAULT_REDO_POLICY)).strip().lower()
+    return candidate if candidate in REDO_POLICY_VALUES else DEFAULT_REDO_POLICY
 
 
 def _initial_summary(total_sources: int = 0) -> Dict[str, Any]:
@@ -874,15 +1035,65 @@ def _should_retry_redo(
     normalization: NormalizationSummary,
     attempt_no: int,
     current_execution_mode: str,
-) -> Tuple[bool, str]:
+    redo_policy: str,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    verdict = _observer_verdict(payload)
+    candidate_count = len(extract_reaction_candidates(payload))
+    allowlisted_issue_codes = sorted(set(verdict["issue_codes"]) & OBSERVER_AUTO_RETRY_ISSUE_CODES)
+    decision = {
+        "policy": redo_policy,
+        "observer_requested_redo": bool(payload.get("redo")),
+        "observer_reason": verdict["reason"],
+        "observer_issue_codes": verdict["issue_codes"],
+        "observer_confidence": verdict["confidence"],
+        "allowlisted_issue_codes": allowlisted_issue_codes,
+        "candidate_count": candidate_count,
+        "accepted_reaction_count": normalization.accepted_reaction_count,
+        "rejected_reaction_count": normalization.rejected_reaction_count,
+        "decision": "not_requested",
+        "decision_reason": "",
+    }
     if attempt_no >= MAX_AUTO_ATTEMPTS_PER_DERIVED_IMAGE:
-        return False, ""
-    if payload.get("redo") and normalization.accepted_reaction_count == 0:
-        if current_execution_mode == "normal":
-            return True, "auto_no_agents_retry"
-        if current_execution_mode == "no_agents":
-            return True, "auto_recovery_retry"
-    return False, ""
+        decision["decision"] = "suppressed"
+        decision["decision_reason"] = "retry_cap_reached"
+        return False, "", decision
+    if not payload.get("redo"):
+        return False, "", decision
+
+    if redo_policy == LEGACY_REDO_POLICY:
+        if normalization.accepted_reaction_count == 0:
+            if current_execution_mode == "normal":
+                decision["decision"] = "allow_auto_no_agents_retry"
+                decision["decision_reason"] = "legacy_observer_redo"
+                return True, "auto_no_agents_retry", decision
+            if current_execution_mode == "no_agents":
+                decision["decision"] = "allow_auto_recovery_retry"
+                decision["decision_reason"] = "legacy_observer_redo"
+                return True, "auto_recovery_retry", decision
+        decision["decision"] = "suppressed"
+        decision["decision_reason"] = "legacy_accepted_reactions_present"
+        return False, "", decision
+
+    if normalization.accepted_reaction_count > 0:
+        decision["decision"] = "suppressed"
+        decision["decision_reason"] = "accepted_reactions_present"
+        return False, "", decision
+    if candidate_count > 0:
+        decision["decision"] = "suppressed"
+        decision["decision_reason"] = "structured_candidates_present"
+        return False, "", decision
+    if current_execution_mode != "normal":
+        decision["decision"] = "suppressed"
+        decision["decision_reason"] = "non_normal_execution_mode"
+        return False, "", decision
+    if candidate_count == 0 and allowlisted_issue_codes:
+        decision["decision"] = "allow_auto_no_agents_retry"
+        decision["decision_reason"] = "observer_allowlisted_empty_extraction"
+        return True, "auto_no_agents_retry", decision
+
+    decision["decision"] = "suppressed"
+    decision["decision_reason"] = "observer_verdict_not_allowlisted"
+    return False, "", decision
 
 
 def _source_summary_status(source_summary: Dict[str, Any]) -> str:
@@ -1782,6 +1993,8 @@ class ReviewDatasetService:
                     status_message=str(exc),
                 )
                 raise
+            finally:
+                _cleanup_runtime_after_source(path.name, source_logger)
             _merge_summary(summary, outcome)
             if outcome["source_status"] == "completed":
                 completed_sources += 1
@@ -2171,128 +2384,132 @@ class ReviewDatasetService:
                 current_source_name=source_filename,
                 status_message=f"Importing sideload source {source_filename}",
             )
-            run_logger.info("source_started", f"Importing sideload source {source_filename}", run_source_id=run_source_id)
-            source_reactions = 0
-            source_failures = 0
-            source_redo = 0
-            for image_index, item in enumerate(group_items):
-                image_name = str(item.get("image_name") or f"{group_key}_{image_index}.png")
-                recovered_image = _recover_file(
-                    payload=item,
-                    file_name=image_name,
-                    json_path=json_path,
-                    recovery_roots=task.recovery_roots,
-                )
-                derived_key = ""
-                artifact_status = "missing"
-                if recovered_image is not None:
-                    derived_key = f"derived/{run_source_id}/{image_index}{recovered_image.suffix.lower() or '.png'}"
-                    if not store.exists(derived_key):
-                        store.put_file(derived_key, str(recovered_image))
-                    artifact_status = "recovered"
-                derived_image_id = self.repository.create_derived_image(
-                    run_source_id=run_source_id,
-                    page_hint=image_name,
-                    image_index=image_index,
-                    artifact_backend=store.backend_name if derived_key else "",
-                    artifact_key=derived_key,
-                    artifact_status=artifact_status,
-                    status="completed",
-                    outcome_class="queued",
-                    raw_artifact_key="",
-                )
-                raw_item_key = f"raw/{task.run_id}/{run_source_id}/image_{image_index}.json"
-                persisted_item = _rewrite_payload_image_refs(
-                    item,
-                    store=store,
-                    artifact_key=derived_key,
-                    artifact_backend=store.backend_name if derived_key else "",
-                )
-                _store_json(store, raw_item_key, persisted_item)
-                attempt = self.repository.create_derived_image_attempt(
-                    derived_image_id=derived_image_id,
-                    trigger="initial",
-                    execution_mode="normal",
-                    status="completed",
-                    config_snapshot_json=_json_dumps(task.config_snapshot),
-                )
-                outcome_class = _classify_payload(item, artifact_missing=(artifact_status == "missing"))
-                normalization = self._persist_reactions(
-                    store=store,
-                    run_id=task.run_id,
-                    run_source_id=run_source_id,
-                    derived_image_id=derived_image_id,
-                    attempt_id=str(attempt["attempt_id"]),
-                    payload=item,
-                    override_outcome="imported_without_artifact" if artifact_status == "missing" else "",
-                )
-                attempt_failure_kind = _stable_failure_category(
-                    normalization_status=normalization.normalization_status,
-                    normalization_summary=normalization.normalization_summary,
-                    outcome_class=outcome_class,
-                    error_summary=str(item.get("error") or ""),
-                )
-                self.repository.finalize_derived_image_attempt(
-                    str(attempt["attempt_id"]),
+            source_logger = run_logger.bind(phase="prepare_source", run_source_id=run_source_id, source_name=source_filename)
+            source_logger.info("source_started", f"Importing sideload source {source_filename}")
+            try:
+                source_reactions = 0
+                source_failures = 0
+                source_redo = 0
+                for image_index, item in enumerate(group_items):
+                    image_name = str(item.get("image_name") or f"{group_key}_{image_index}.png")
+                    recovered_image = _recover_file(
+                        payload=item,
+                        file_name=image_name,
+                        json_path=json_path,
+                        recovery_roots=task.recovery_roots,
+                    )
+                    derived_key = ""
+                    artifact_status = "missing"
+                    if recovered_image is not None:
+                        derived_key = f"derived/{run_source_id}/{image_index}{recovered_image.suffix.lower() or '.png'}"
+                        if not store.exists(derived_key):
+                            store.put_file(derived_key, str(recovered_image))
+                        artifact_status = "recovered"
+                    derived_image_id = self.repository.create_derived_image(
+                        run_source_id=run_source_id,
+                        page_hint=image_name,
+                        image_index=image_index,
+                        artifact_backend=store.backend_name if derived_key else "",
+                        artifact_key=derived_key,
+                        artifact_status=artifact_status,
+                        status="completed",
+                        outcome_class="queued",
+                        raw_artifact_key="",
+                    )
+                    raw_item_key = f"raw/{task.run_id}/{run_source_id}/image_{image_index}.json"
+                    persisted_item = _rewrite_payload_image_refs(
+                        item,
+                        store=store,
+                        artifact_key=derived_key,
+                        artifact_backend=store.backend_name if derived_key else "",
+                    )
+                    _store_json(store, raw_item_key, persisted_item)
+                    attempt = self.repository.create_derived_image_attempt(
+                        derived_image_id=derived_image_id,
+                        trigger="initial",
+                        execution_mode="normal",
+                        status="completed",
+                        config_snapshot_json=_json_dumps(task.config_snapshot),
+                    )
+                    outcome_class = _classify_payload(item, artifact_missing=(artifact_status == "missing"))
+                    normalization = self._persist_reactions(
+                        store=store,
+                        run_id=task.run_id,
+                        run_source_id=run_source_id,
+                        derived_image_id=derived_image_id,
+                        attempt_id=str(attempt["attempt_id"]),
+                        payload=item,
+                        override_outcome="imported_without_artifact" if artifact_status == "missing" else "",
+                    )
+                    attempt_failure_kind = _stable_failure_category(
+                        normalization_status=normalization.normalization_status,
+                        normalization_summary=normalization.normalization_summary,
+                        outcome_class=outcome_class,
+                        error_summary=str(item.get("error") or ""),
+                    )
+                    self.repository.finalize_derived_image_attempt(
+                        str(attempt["attempt_id"]),
+                        {
+                            "status": "completed",
+                            "failure_kind": attempt_failure_kind,
+                            "raw_artifact_key": raw_item_key,
+                            "error_summary": str(item.get("error") or ""),
+                        },
+                    )
+                    self.repository.finalize_derived_image_summary(
+                        derived_image_id,
+                        {
+                            "status": "completed" if outcome_class != "failed" else "failed",
+                            "status_message": f"Sideload item {image_name} imported.",
+                            "outcome_class": outcome_class,
+                            "raw_artifact_key": raw_item_key,
+                            "error_text": str(item.get("error") or ""),
+                            "reaction_count": normalization.accepted_reaction_count,
+                            "accepted_reaction_count": normalization.accepted_reaction_count,
+                            "rejected_reaction_count": normalization.rejected_reaction_count,
+                            "normalization_status": normalization.normalization_status,
+                            "normalization_summary": normalization.normalization_summary,
+                            "redo_count": 1 if outcome_class == "needs_redo" else 0,
+                            "attempt_count": int(attempt["attempt_no"]),
+                            "last_attempt_id": str(attempt["attempt_id"]),
+                            "last_retry_reason": "initial",
+                        },
+                    )
+                    summary["total_derived_images"] += 1
+                    summary["total_reactions"] += normalization.accepted_reaction_count
+                    summary["total_failures"] += 1 if outcome_class == "failed" else 0
+                    summary["total_redo"] += 1 if outcome_class == "needs_redo" else 0
+                    source_reactions += normalization.accepted_reaction_count
+                    source_failures += 1 if outcome_class == "failed" else 0
+                    source_redo += 1 if outcome_class == "needs_redo" else 0
+                self.repository.finalize_run_source_summary(
+                    run_source_id,
                     {
-                        "status": "completed",
-                        "failure_kind": attempt_failure_kind,
-                        "raw_artifact_key": raw_item_key,
-                        "error_summary": str(item.get("error") or ""),
+                        "status": "failed" if source_failures and source_reactions == 0 else "completed",
+                        "status_message": f"Sideload source {source_filename} imported.",
+                        "expected_derived_images": len(group_items),
+                        "completed_derived_images": len(group_items),
+                        "successful_derived_images": len(group_items) - source_failures,
+                        "failed_derived_images": source_failures,
+                        "reaction_count": source_reactions,
+                        "redo_count": source_redo,
+                        "error_summary": "" if not source_failures else f"{source_failures} sideload item(s) failed.",
                     },
                 )
-                self.repository.finalize_derived_image_summary(
-                    derived_image_id,
-                    {
-                        "status": "completed" if outcome_class != "failed" else "failed",
-                        "status_message": f"Sideload item {image_name} imported.",
-                        "outcome_class": outcome_class,
-                        "raw_artifact_key": raw_item_key,
-                        "error_text": str(item.get("error") or ""),
-                        "reaction_count": normalization.accepted_reaction_count,
-                        "accepted_reaction_count": normalization.accepted_reaction_count,
-                        "rejected_reaction_count": normalization.rejected_reaction_count,
-                        "normalization_status": normalization.normalization_status,
-                        "normalization_summary": normalization.normalization_summary,
-                        "redo_count": 1 if outcome_class == "needs_redo" else 0,
-                        "attempt_count": int(attempt["attempt_no"]),
-                        "last_attempt_id": str(attempt["attempt_id"]),
-                        "last_retry_reason": "initial",
-                    },
+                if source_failures and source_reactions == 0:
+                    failed_sources += 1
+                else:
+                    completed_sources += 1
+                self.repository.update_run_summary(task.run_id, summary)
+                self.repository.update_run_live_state(
+                    task.run_id,
+                    completed_sources=completed_sources,
+                    failed_sources=failed_sources,
+                    current_phase="source_completed",
+                    status_message=f"Finished sideload source {source_filename}",
                 )
-                summary["total_derived_images"] += 1
-                summary["total_reactions"] += normalization.accepted_reaction_count
-                summary["total_failures"] += 1 if outcome_class == "failed" else 0
-                summary["total_redo"] += 1 if outcome_class == "needs_redo" else 0
-                source_reactions += normalization.accepted_reaction_count
-                source_failures += 1 if outcome_class == "failed" else 0
-                source_redo += 1 if outcome_class == "needs_redo" else 0
-            self.repository.finalize_run_source_summary(
-                run_source_id,
-                {
-                    "status": "failed" if source_failures and source_reactions == 0 else "completed",
-                    "status_message": f"Sideload source {source_filename} imported.",
-                    "expected_derived_images": len(group_items),
-                    "completed_derived_images": len(group_items),
-                    "successful_derived_images": len(group_items) - source_failures,
-                    "failed_derived_images": source_failures,
-                    "reaction_count": source_reactions,
-                    "redo_count": source_redo,
-                    "error_summary": "" if not source_failures else f"{source_failures} sideload item(s) failed.",
-                },
-            )
-            if source_failures and source_reactions == 0:
-                failed_sources += 1
-            else:
-                completed_sources += 1
-            self.repository.update_run_summary(task.run_id, summary)
-            self.repository.update_run_live_state(
-                task.run_id,
-                completed_sources=completed_sources,
-                failed_sources=failed_sources,
-                current_phase="source_completed",
-                status_message=f"Finished sideload source {source_filename}",
-            )
+            finally:
+                _cleanup_runtime_after_source(source_filename, source_logger)
         return summary
 
     def _prepare_live_source(
@@ -2432,13 +2649,6 @@ class ReviewDatasetService:
                             execution_mode=current_execution_mode,
                         )
                     raw_key = f"raw/{task.run_id}/{run_source_id}/image_{image_index}_attempt_{attempt_no}.json"
-                    persisted_payload = _rewrite_payload_image_refs(
-                        payload,
-                        store=store,
-                        artifact_key=derived_artifact_key,
-                        artifact_backend=store.backend_name,
-                    )
-                    _store_json(store, raw_key, persisted_payload)
                     if metrics.calls:
                         self.repository.add_llm_call_metrics(
                             run_id=task.run_id,
@@ -2462,6 +2672,26 @@ class ReviewDatasetService:
                         normalization_summary=normalization.normalization_summary,
                         outcome_class=outcome_class,
                     )
+                    retry_redo, next_trigger, redo_decision = _should_retry_redo(
+                        payload=payload,
+                        normalization=normalization,
+                        attempt_no=attempt_no,
+                        current_execution_mode=current_execution_mode,
+                        redo_policy=_redo_policy(task.config_snapshot),
+                    )
+                    payload_for_storage = payload
+                    if isinstance(payload, dict):
+                        payload_for_storage = dict(payload)
+                        if payload.get("redo") or payload.get("observer_verdict"):
+                            payload_for_storage["observer_verdict"] = _observer_verdict(payload)
+                            payload_for_storage["redo_decision"] = redo_decision
+                    persisted_payload = _rewrite_payload_image_refs(
+                        payload_for_storage,
+                        store=store,
+                        artifact_key=derived_artifact_key,
+                        artifact_backend=store.backend_name,
+                    )
+                    _store_json(store, raw_key, persisted_payload)
                     self.repository.finalize_derived_image_attempt(
                         attempt_id,
                         {
@@ -2476,12 +2706,20 @@ class ReviewDatasetService:
                             "usage_completeness": metrics_summary["usage_completeness"],
                         },
                     )
-                    retry_redo, next_trigger = _should_retry_redo(
-                        payload=payload,
-                        normalization=normalization,
-                        attempt_no=attempt_no,
-                        current_execution_mode=current_execution_mode,
-                    )
+                    if payload.get("redo"):
+                        derived_logger.warning(
+                            "observer_requested_redo",
+                            f"Observer requested redo for derived image {image_index + 1} of {source_name}",
+                            attempt_no=attempt_no,
+                            execution_mode=current_execution_mode,
+                            redo_policy=redo_decision["policy"],
+                            observer_reason=redo_decision["observer_reason"],
+                            observer_issue_codes=",".join(redo_decision["observer_issue_codes"]),
+                            observer_confidence=redo_decision["observer_confidence"],
+                            candidate_count=redo_decision["candidate_count"],
+                            accepted_reaction_count=redo_decision["accepted_reaction_count"],
+                            rejected_reaction_count=redo_decision["rejected_reaction_count"],
+                        )
                     if retry_redo:
                         self.repository.update_derived_image_status(
                             derived_image_id,
@@ -2498,6 +2736,15 @@ class ReviewDatasetService:
                             last_retry_reason=next_trigger,
                             attempt_count=attempt_no,
                         )
+                        derived_logger.info(
+                            "gated_retry_allowed",
+                            f"Gated retry allowed for derived image {image_index + 1} of {source_name}",
+                            attempt_no=attempt_no,
+                            retry_trigger=next_trigger,
+                            redo_policy=redo_decision["policy"],
+                            decision_reason=redo_decision["decision_reason"],
+                            allowlisted_issue_codes=",".join(redo_decision["allowlisted_issue_codes"]),
+                        )
                         derived_logger.warning(
                             "derived_image_retry_scheduled",
                             f"Retrying derived image {image_index + 1} for {source_name} after redo-only output",
@@ -2509,6 +2756,16 @@ class ReviewDatasetService:
                         current_execution_mode = _execution_mode_for_trigger(next_trigger, fallback=current_execution_mode)
                         time.sleep(_retry_backoff_seconds(attempt_no))
                         continue
+                    if payload.get("redo"):
+                        derived_logger.info(
+                            "gated_retry_suppressed",
+                            f"Gated retry suppressed for derived image {image_index + 1} of {source_name}",
+                            attempt_no=attempt_no,
+                            execution_mode=current_execution_mode,
+                            redo_policy=redo_decision["policy"],
+                            decision_reason=redo_decision["decision_reason"],
+                            allowlisted_issue_codes=",".join(redo_decision["allowlisted_issue_codes"]),
+                        )
                     self.repository.finalize_derived_image_summary(
                         derived_image_id,
                         {
@@ -2822,6 +3079,7 @@ def _apply_runtime_env(config: Dict[str, Any]) -> None:
             os.environ.pop(key.upper(), None)
         else:
             os.environ[key.upper()] = str(value)
+    configure_transformers_runtime()
 
 
 _SERVICE_CACHE: Dict[str, ReviewDatasetService] = {}

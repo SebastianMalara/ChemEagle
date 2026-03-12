@@ -11,6 +11,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
 
+from hf_runtime import configure_transformers_runtime
+
+configure_transformers_runtime()
+
 from transformers import BertTokenizerFast, AutoTokenizer, RobertaTokenizerFast
 
 from .utils import get_class_to_index
@@ -167,6 +171,5 @@ def get_collate_fn():
         return sentences, masks, refs
 
     return collate
-
 
 

@@ -1,5 +1,9 @@
 import os
 from pdf2image import convert_from_path
+from hf_runtime import configure_transformers_runtime
+
+configure_transformers_runtime()
+
 from transformers import AutoProcessor, AutoModelForCausalLM, logging as transformers_logging
 from safetensors.torch import load_file
 from asset_registry import ensure_asset_available

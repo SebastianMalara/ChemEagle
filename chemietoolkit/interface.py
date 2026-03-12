@@ -10,6 +10,7 @@ from rxnim import RxnIM, MolDetect
 from chemiener import ChemNER
 from asset_registry import ensure_asset_available
 from .chemrxnextractor import ChemRxnExtractor
+from .molecule_smiles_rescue import apply_smiles_rescue
 from .tableextractor import TableExtractor
 from .utils import *
 from runtime_device import resolve_torch_device, warn_once
@@ -330,7 +331,12 @@ class ChemIEToolkit:
         bboxes = self.extract_molecule_bboxes_from_figures(figures, batch_size=batch_size)
         figures = [convert_to_cv2(figure) for figure in figures]
         results, cropped_images, refs = clean_bbox_output(figures, bboxes)
-        mol_info = self.molnextr.predict_images(cropped_images, batch_size=batch_size)
+        mol_info = self.molnextr.predict_images(
+            cropped_images,
+            batch_size=batch_size,
+            return_confidence=True,
+        )
+        mol_info = apply_smiles_rescue(mol_info, cropped_images)
         for info, ref in zip(mol_info, refs):
             ref.update(info)
         return results

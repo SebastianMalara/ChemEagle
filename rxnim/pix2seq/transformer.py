@@ -15,6 +15,10 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from .attention_layer import Attention
 
+from hf_runtime import configure_transformers_runtime
+
+configure_transformers_runtime()
+
 from transformers import EncoderDecoderConfig, EncoderDecoderModel, AutoConfig, BertConfig
 
 

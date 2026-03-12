@@ -64,6 +64,22 @@ class LlmPreflightTests(unittest.TestCase):
         self.assertEqual(len(diagnostics["blocking_errors"]), 1)
         self.assertIn("vision unsupported", diagnostics["blocking_errors"][0])
 
+    def test_collect_runtime_provider_preflight_skips_optional_main_probe_in_local_mode(self) -> None:
+        config = {
+            "CHEMEAGLE_RUN_MODE": "local_os",
+            "LLM_PROVIDER": "openai_compatible",
+            "LLM_MODEL": "gpt-5-mini",
+            "OPENAI_BASE_URL": "http://localhost:8000/v1",
+            "OPENAI_API_KEY": "EMPTY",
+            "OCR_BACKEND": "easyocr",
+        }
+        with mock.patch("llm_preflight.probe_llm_profile") as probe:
+            diagnostics = collect_runtime_provider_preflight(profile_configs=[config], mode="local_os")
+
+        probe.assert_not_called()
+        self.assertEqual(diagnostics["results"], [])
+        self.assertEqual(diagnostics["status"], "passed")
+
     def test_unsupported_parameter_is_not_misclassified_as_model_capability(self) -> None:
         failure = classify_provider_exception(
             RuntimeError(

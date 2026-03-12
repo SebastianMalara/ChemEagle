@@ -1,6 +1,9 @@
 import torch
 from torch import nn
 
+from hf_runtime import configure_transformers_runtime
+
+configure_transformers_runtime()
 
 from transformers import BertForTokenClassification, RobertaForTokenClassification, AutoModelForTokenClassification
 
