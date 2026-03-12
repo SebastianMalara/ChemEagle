@@ -10,6 +10,10 @@ def configure_transformers_runtime() -> None:
     os.environ.setdefault("USE_TORCH", "1")
     os.environ.setdefault("USE_FLAX", "0")
     os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+    # Rust tokenizers warn when a process forks after tokenizer parallelism was
+    # initialized. Disable that parallelism up front because ChemEagle uses
+    # multiprocessing workers in a few training/evaluation paths.
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 configure_transformers_runtime()

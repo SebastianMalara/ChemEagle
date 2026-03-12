@@ -19,7 +19,10 @@ def _load_module(module_name: str, path: Path):
 class HfRuntimeTests(unittest.TestCase):
     def test_hf_runtime_sets_transformers_env_guards(self) -> None:
         path = Path(__file__).resolve().parents[1] / "hf_runtime.py"
-        old_env = {key: os.environ.get(key) for key in ("USE_TF", "USE_TORCH", "USE_FLAX", "TRANSFORMERS_NO_TF")}
+        old_env = {
+            key: os.environ.get(key)
+            for key in ("USE_TF", "USE_TORCH", "USE_FLAX", "TRANSFORMERS_NO_TF", "TOKENIZERS_PARALLELISM")
+        }
         try:
             for key in old_env:
                 os.environ.pop(key, None)
@@ -28,6 +31,7 @@ class HfRuntimeTests(unittest.TestCase):
             self.assertEqual(os.environ.get("USE_TORCH"), "1")
             self.assertEqual(os.environ.get("USE_FLAX"), "0")
             self.assertEqual(os.environ.get("TRANSFORMERS_NO_TF"), "1")
+            self.assertEqual(os.environ.get("TOKENIZERS_PARALLELISM"), "false")
         finally:
             for key, value in old_env.items():
                 if value is None:

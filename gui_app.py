@@ -23,6 +23,7 @@ from llm_profiles import MANUAL_MODEL_LIST_PROVIDERS, list_available_models, res
 from review_artifacts import create_artifact_store_from_config
 from review_service import get_review_service
 from runtime_device import resolve_ocr_backend
+from webapp.api import runtime as api_runtime
 
 import pandas as pd
 
@@ -2562,6 +2563,35 @@ def save_reaction_review_view(reaction_uid: str, review_status: str, review_note
         return "No reaction selected.", "{}"
     get_review_service(review_db_path).update_reaction_review(reaction_uid, review_status=review_status, review_notes=review_notes)
     return f"Saved review state for {reaction_uid}.", _json_text({"reaction_uid": reaction_uid, "review_status": review_status, "review_notes": review_notes})
+
+
+# Rebind extracted backend-agnostic helpers so Gradio and FastAPI share the same runtime logic.
+parse_env_file = api_runtime.parse_env_file
+merged_env_values = api_runtime.merged_env_values
+save_env_file = api_runtime.save_env_file
+apply_runtime_env = api_runtime.apply_runtime_env
+build_runtime_values = api_runtime.build_runtime_values
+_resolve_upload_path = api_runtime.resolve_upload_path
+_resolve_upload_paths = api_runtime.resolve_upload_paths
+_scan_supported_files = api_runtime.scan_supported_files
+_env_truthy = api_runtime.env_truthy
+_build_dataset_runtime_values = api_runtime.build_dataset_runtime_values
+_parse_profile_configs = api_runtime.parse_profile_configs
+_collect_batch_runtime_diagnostics = api_runtime.collect_batch_runtime_diagnostics
+_model_picker_help = api_runtime.model_picker_help
+_ocr_profile_summary = api_runtime.ocr_profile_summary
+_model_choices = api_runtime.model_choices
+_model_catalog_guard = api_runtime.model_catalog_guard
+_probe_python_code = api_runtime.probe_python_code
+_resolve_tesseract_cmd = api_runtime.resolve_tesseract_cmd
+_profile_preflight = api_runtime.profile_preflight
+_ocr_preflight = api_runtime.ocr_preflight
+_torch_runtime_preflight = api_runtime.torch_runtime_preflight
+_molecule_smiles_rescue_preflight = api_runtime.molecule_smiles_rescue_preflight
+_model_catalog_preflight = api_runtime.model_catalog_preflight
+_pdf_preflight = api_runtime.pdf_preflight
+_asset_preflight = api_runtime.asset_preflight
+collect_preflight_diagnostics = api_runtime.collect_preflight_diagnostics
 
 
 def build_app() -> gr.Blocks:
