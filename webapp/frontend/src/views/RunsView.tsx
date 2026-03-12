@@ -1,12 +1,18 @@
 import { useEffect, useState } from "react";
 import { api } from "../api/client";
 import { useAsyncResource, usePollingResource } from "../api/hooks";
-import type { DerivedImage, ExperimentSummary, RunSourceDetail, RunSummary } from "../api/types";
+import type { DerivedImage, ExperimentSummary, ExportedRun, RunSourceDetail, RunSummary } from "../api/types";
 
 function statusTone(status?: string) {
   if (status === "completed") return "chip-ok";
   if (status === "failed" || status === "interrupted") return "chip-warn";
   return "";
+}
+
+function summarizeExportedFiles(files: ExportedRun) {
+  const count = Object.values(files).filter(Boolean).length;
+  if (!count) return "Export completed.";
+  return `Exported ${count} parquet file${count === 1 ? "" : "s"}.`;
 }
 
 export function RunsView() {
@@ -30,6 +36,7 @@ export function RunsView() {
   const [sourceDetail, setSourceDetail] = useState<RunSourceDetail | null>(null);
   const [exportDir, setExportDir] = useState("./data/exports");
   const [actionStatus, setActionStatus] = useState("");
+  const [showRunTail, setShowRunTail] = useState(false);
 
   useEffect(() => {
     if (runsResource.data?.length && !selectedRun) {
@@ -67,6 +74,9 @@ export function RunsView() {
     sourceDetail?.derived_images.find((item) => item.derived_image_id === selectedDerived) ||
     sourceDetail?.derived_images[0] ||
     null;
+  const progressSummary =
+    monitorResource.data?.progress.status_summary ||
+    (selectedRun ? "Polling run status." : "Select a run to start monitoring.");
 
   async function runAction(action: () => Promise<{ message?: string }>, fallback: string) {
     const response = await action();
@@ -79,11 +89,8 @@ export function RunsView() {
       <header className="page-hero">
         <div className="hero-copy">
           <p className="eyebrow">Runs</p>
-          <h2>Polling monitor for experiments, sources, derived images, retries, and exports.</h2>
-          <p className="hero-text">
-            This keeps the current timer-driven behavior but turns it into a
-            cleaner operational view instead of a callback dump.
-          </p>
+          <h2>Run monitor</h2>
+          <p className="hero-text">Poll live runs, recover failures, export results.</p>
         </div>
         <div className="hero-stats">
           <div className="stat-card">
@@ -137,7 +144,7 @@ export function RunsView() {
               <p className="panel-kicker">Progress</p>
               <h3>Live monitor</h3>
             </div>
-            <p className="table-count">{monitorResource.data?.progress.status_summary || actionStatus}</p>
+            <p className="table-count">{progressSummary}</p>
           </div>
           <div className="progress-shell">
             <div
@@ -168,47 +175,50 @@ export function RunsView() {
           <div className="chip-row">
             {Object.entries(monitorResource.data?.aggregates || {}).map(([key, value]) => (
               <span className="chip" key={key}>
-                {key.replaceAll("_", " ")} {value}
+                {key.split("_").join(" ")} {value}
               </span>
             ))}
           </div>
+          {actionStatus ? <p className="panel-note">{actionStatus}</p> : null}
         </div>
 
         <div className="page-grid">
-          <section className="panel panel-stack">
+          <section className="panel panel-stack batch-pane">
             <div className="panel-header">
               <div>
                 <p className="panel-kicker">Run sources</p>
                 <h3>Source queue</h3>
               </div>
             </div>
-            <div className="table-wrap">
-              <table className="reaction-table">
-                <thead>
-                  <tr>
-                    <th>Source</th>
-                    <th>Status</th>
-                    <th>Phase</th>
-                    <th>Derived</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {monitorResource.data?.sources.map((source) => (
-                    <tr
-                      className={source.run_source_id === selectedSource ? "is-active-row" : ""}
-                      key={source.run_source_id}
-                      onClick={() => setSelectedSource(source.run_source_id)}
-                    >
-                      <td>{source.original_filename}</td>
-                      <td>{source.status}</td>
-                      <td>{source.current_phase}</td>
-                      <td>
-                        {source.completed_derived_images}/{source.expected_derived_images}
-                      </td>
+            <div className="batch-pane-scroll">
+              <div className="table-wrap batch-table-wrap">
+                <table className="reaction-table">
+                  <thead>
+                    <tr>
+                      <th>Source</th>
+                      <th>Status</th>
+                      <th>Phase</th>
+                      <th>Derived</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {monitorResource.data?.sources.map((source) => (
+                      <tr
+                        className={source.run_source_id === selectedSource ? "is-active-row" : ""}
+                        key={source.run_source_id}
+                        onClick={() => setSelectedSource(source.run_source_id)}
+                      >
+                        <td>{source.original_filename}</td>
+                        <td>{source.status}</td>
+                        <td>{source.current_phase}</td>
+                        <td>
+                          {source.completed_derived_images}/{source.expected_derived_images}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
 
             <label className="field">
@@ -248,7 +258,7 @@ export function RunsView() {
             </div>
           </section>
 
-          <section className="panel panel-stack">
+          <section className="panel panel-stack batch-pane">
             <div className="panel-header">
               <div>
                 <p className="panel-kicker">Derived detail</p>
@@ -256,7 +266,7 @@ export function RunsView() {
               </div>
             </div>
             {selectedDerivedImage ? (
-              <>
+              <div className="batch-pane-scroll">
                 <div className="meta-grid">
                   <div>
                     <dt>Outcome</dt>
@@ -302,7 +312,7 @@ export function RunsView() {
                     Reprocess derived
                   </button>
                 </div>
-                <div className="table-wrap">
+                <div className="table-wrap batch-table-wrap">
                   <table className="detail-table">
                     <thead>
                       <tr>
@@ -328,9 +338,9 @@ export function RunsView() {
                     </tbody>
                   </table>
                 </div>
-              </>
+              </div>
             ) : (
-              <div className="empty-state">
+              <div className="empty-state batch-pane-scroll">
                 <p className="panel-kicker">Awaiting selection</p>
                 <h3>No derived image selected</h3>
                 <p>Pick a source and derived image to inspect attempts or trigger recovery actions.</p>
@@ -340,40 +350,57 @@ export function RunsView() {
         </div>
 
         <div className="page-grid">
-          <section className="panel panel-stack">
-            <div className="panel-header">
-              <div>
-                <p className="panel-kicker">Logs</p>
-                <h3>Run tail</h3>
-              </div>
-            </div>
-            <pre className="json-block log-block">
-              {monitorResource.data?.log_tail.formatted || "No log tail available."}
-            </pre>
-          </section>
-          <section className="panel panel-stack">
+          <section className="panel panel-stack batch-support-panel">
             <div className="panel-header">
               <div>
                 <p className="panel-kicker">Export</p>
                 <h3>Parquet output</h3>
               </div>
             </div>
-            <p className="hero-text">
-              Exports stay explicit. The frontend only requests them; the backend
-              remains responsible for writing parquet files on the server.
+            <p className="panel-note">
+              Exports stay explicit. The server writes parquet files; this screen only triggers the job.
             </p>
             <button
               className="button button-primary"
               disabled={!selectedRun}
-              onClick={() =>
-                void api.exportRun(selectedRun, exportDir).then((response) => {
-                  setActionStatus(JSON.stringify(response, null, 2));
-                })
-              }
+              onClick={() => {
+                void api
+                  .exportRun(selectedRun, exportDir)
+                  .then((response) => {
+                    setActionStatus(summarizeExportedFiles(response));
+                  })
+                  .catch((error: Error) => {
+                    setActionStatus(error.message);
+                  });
+              }}
             >
               Export selected run
             </button>
-            <pre className="json-block">{actionStatus}</pre>
+          </section>
+          <section className="panel panel-stack batch-support-panel">
+            <div className="panel-header">
+              <div>
+                <p className="panel-kicker">Debug</p>
+                <h3>Run tail</h3>
+              </div>
+              <button
+                className="button"
+                disabled={!selectedRun}
+                onClick={() => setShowRunTail((open) => !open)}
+                type="button"
+              >
+                {showRunTail ? "Hide log" : "Open log"}
+              </button>
+            </div>
+            {showRunTail ? (
+              <pre className="json-block log-block">
+                {monitorResource.data?.log_tail.formatted || "No log tail available."}
+              </pre>
+            ) : (
+              <p className="panel-note">
+                Keep the progress surface clean. Open the run tail only when you need troubleshooting detail.
+              </p>
+            )}
           </section>
         </div>
       </div>

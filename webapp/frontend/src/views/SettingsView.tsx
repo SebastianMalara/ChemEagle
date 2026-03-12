@@ -81,11 +81,8 @@ export function SettingsView() {
       <header className="page-hero">
         <div className="hero-copy">
           <p className="eyebrow">Settings</p>
-          <h2>Runtime profiles, OCR behavior, PDF extraction, and storage.</h2>
-          <p className="hero-text">
-            This view stays close to the existing Gradio configuration surface,
-            but puts the shape into a more inspectable web app.
-          </p>
+          <h2>Runtime control</h2>
+          <p className="hero-text">Profiles, OCR, storage, and preflight.</p>
         </div>
         <div className="hero-stats">
           <div className="stat-card">

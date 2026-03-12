@@ -154,7 +154,7 @@ export const api = {
         }).then((response) => ({
           ...response,
           run_ids: response.run_ids || [],
-        }),
+        })),
       () => mockSubmission,
     );
   },
@@ -169,7 +169,7 @@ export const api = {
         }).then((response) => ({
           ...response,
           run_ids: response.run_ids || [],
-        }),
+        })),
       () => mockSubmission,
     );
   },

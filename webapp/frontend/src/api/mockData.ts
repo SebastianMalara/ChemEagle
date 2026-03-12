@@ -29,7 +29,7 @@ export const mockConfig: ConfigResponse = {
 export const mockExperiments: ExperimentSummary[] = [
   {
     experiment_id: "exp-demo-1",
-    name: "ChemEagle Review Experiment",
+    name: "Paperbreaker Review Experiment",
     status: "running",
     run_count: 2,
     created_at: "2026-03-12T10:00:00Z",
@@ -47,7 +47,7 @@ export const mockRuns: RunSummary[] = [
   {
     run_id: "run-demo-1",
     experiment_id: "exp-demo-1",
-    experiment_name: "ChemEagle Review Experiment",
+    experiment_name: "Paperbreaker Review Experiment",
     profile_label: "baseline",
     ingest_mode: "live_batch",
     status: "running",
@@ -60,7 +60,7 @@ export const mockRuns: RunSummary[] = [
   {
     run_id: "run-demo-2",
     experiment_id: "exp-demo-1",
-    experiment_name: "ChemEagle Review Experiment",
+    experiment_name: "Paperbreaker Review Experiment",
     profile_label: "no_agents_retry",
     ingest_mode: "live_batch",
     status: "queued",
@@ -258,7 +258,8 @@ export const mockReactionDetail: ReactionDetail = {
     { info_type: "yield", value_text: "78%" },
     { info_type: "catalyst", value_text: "Pd(PPh3)4" },
   ],
-  source_artifact_url: "#",
+  source_artifact_url:
+    "https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=1800&q=80",
   derived_artifact_url:
     "https://images.unsplash.com/photo-1532187863486-abf9dbad1b69?auto=format&fit=crop&w=1200&q=80",
   render_artifact_url:

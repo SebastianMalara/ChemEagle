@@ -11,8 +11,8 @@ describe("App", () => {
       </MemoryRouter>,
     );
 
-    expect(screen.getByText("ChemEagle Web")).toBeInTheDocument();
+    expect(screen.getAllByText("Paperbreaker").length).toBeGreaterThan(0);
     expect(screen.getByRole("link", { name: "Review" })).toBeInTheDocument();
-    expect(screen.getByText("Reaction review without setup friction.")).toBeInTheDocument();
+    expect(screen.getByText("Review console")).toBeInTheDocument();
   });
 });
