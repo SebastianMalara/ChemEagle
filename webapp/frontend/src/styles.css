@@ -1135,7 +1135,8 @@ h4 {
 
 .queue-scroll {
   min-height: 0;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   padding-right: 6px;
   margin-right: -6px;
 }
@@ -1149,7 +1150,8 @@ h4 {
   display: grid;
   gap: 10px;
   width: 100%;
-  padding: 16px;
+  min-width: 0;
+  padding: 14px;
   border: 1px solid rgba(93, 71, 48, 0.14);
   border-radius: var(--radius-md);
   background: rgba(255, 255, 255, 0.04);
@@ -1161,7 +1163,7 @@ h4 {
 
 .queue-card:hover,
 .queue-card.is-active {
-  transform: translateX(3px);
+  transform: translateY(-1px);
   border-color: var(--panel-edge);
   background: var(--accent-soft);
   box-shadow: 0 16px 36px rgba(0, 0, 0, 0.08);
@@ -1170,44 +1172,89 @@ h4 {
 .queue-card-header,
 .queue-card-footer {
   display: flex;
-  align-items: center;
+  align-items: start;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
+  min-width: 0;
 }
 
 .queue-card-title {
-  font-size: 1.1rem;
+  min-width: 0;
+  font-size: 1rem;
+  line-height: 1.1;
+}
+
+.queue-card-page {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-family: "SFMono-Regular", "Menlo", "Monaco", monospace;
+  letter-spacing: 0.05em;
+  text-align: right;
+  text-transform: uppercase;
 }
 
 .queue-chip {
-  min-height: 28px;
-  padding: 4px 10px;
-  font-size: 0.76rem;
+  min-height: 24px;
+  max-width: 100%;
+  padding: 3px 8px;
+  font-size: 0.67rem;
   font-family: "SFMono-Regular", "Menlo", "Monaco", monospace;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.queue-chip-muted {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
 }
 
 .queue-card-source,
 .queue-card-subtle {
   margin: 0;
+  min-width: 0;
 }
 
 .queue-card-source {
   font-weight: 600;
-  line-height: 1.4;
+  font-size: 0.88rem;
+  line-height: 1.35;
   word-break: break-word;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
 }
 
 .queue-card-subtle,
 .queue-card-footer {
   color: var(--muted);
-  font-size: 0.84rem;
+  font-size: 0.78rem;
 }
 
 .queue-card-footer {
+  align-items: center;
+  flex-wrap: wrap;
   font-family: "SFMono-Regular", "Menlo", "Monaco", monospace;
   letter-spacing: 0.03em;
+}
+
+.queue-card-profile {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.queue-card-tags {
+  display: flex;
+  flex: 1 1 15rem;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
 }
 
 .preview-grid {

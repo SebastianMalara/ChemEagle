@@ -247,13 +247,21 @@ export function ReviewView() {
                 >
                   <div className="queue-card-header">
                     <strong className="queue-card-title">{safeText(reaction.reaction_id)}</strong>
-                    <span className="chip queue-chip">{safeText(reaction.review_status)}</span>
+                    <span className="queue-card-page">
+                      {safeText(reaction.page_hint, "page/image unavailable")}
+                    </span>
                   </div>
                   <p className="queue-card-source">{safeText(reaction.original_filename)}</p>
-                  <p className="queue-card-subtle">{safeText(reaction.page_hint, "page/image unavailable")}</p>
                   <div className="queue-card-footer">
-                    <span>{safeText(reaction.profile_label, "profile unavailable")}</span>
-                    <span>{safeText(reaction.structure_quality)}</span>
+                    <span className="queue-card-profile">
+                      {safeText(reaction.profile_label, "profile unavailable")}
+                    </span>
+                    <div className="queue-card-tags">
+                      <span className="chip queue-chip queue-chip-muted">
+                        {safeText(reaction.structure_quality)}
+                      </span>
+                      <span className="chip queue-chip">{safeText(reaction.review_status)}</span>
+                    </div>
                   </div>
                 </button>
               ))}
